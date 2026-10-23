@@ -21,5 +21,11 @@ service cloud.firestore {
                             && signedIn() && (request.auth.uid == uid || isAdmin());
       allow delete:         if (course == 'students' || course == 'students_sql') && isAdmin();
     }
+
+    // Impostazioni condivise (classi e scadenze): le leggono tutti gli utenti autenticati, le scrive solo il docente
+    match /config/{doc} {
+      allow read:  if signedIn();
+      allow write: if isAdmin();
+    }
   }
 }

@@ -1,0 +1,45 @@
+rules_version = '2';
+// Regole Firestore da usare DOPO aver attivato la correzione sul server (Cloud Functions).
+// Rispetto a firestore.rules impediscono agli studenti di scrivere verifica, risultati e attestato:
+// li può scrivere solo il server (o il docente dal pannello).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'giuseppemagnani@gmail.com';
+    }
+    function isCourse(course) { return course == 'students' || course == 'students_sql'; }
+    function own(uid) { return signedIn() && request.auth.uid == uid; }
+
+    // Campi che solo il server può scrivere
+    function protectedKeys() { return ['exam', 'examAttempts', 'passed', 'extraAttempts', 'cooldownResetAt']; }
+    function cleanNewDoc() {
+      let d = request.resource.data;
+      return (!('exam' in d) || d.exam == null)
+          && (!('examAttempts' in d) || d.examAttempts.size() == 0)
+          && (!('passed' in d) || d.passed == null)
+          && (!('extraAttempts' in d) || d.extraAttempts == 0)
+          && !('cooldownResetAt' in d);
+    }
+    function examFieldsUntouched() {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(protectedKeys());
+    }
+
+    // Un documento per studente e per corso: students/{uid} (DB Quest), students_sql/{uid} (SQL Quest)
+    match /{course}/{uid} {
+      allow read:   if isCourse(course) && (own(uid) || isAdmin());
+      allow create: if isCourse(course) && ((own(uid) && cleanNewDoc()) || isAdmin());
+      allow update: if isCourse(course) && ((own(uid) && examFieldsUntouched()) || isAdmin());
+      allow delete: if isCourse(course) && isAdmin();
+    }
+
+    // Impostazioni condivise (classi e scadenze)
+    match /config/{doc} {
+      allow read:  if signedIn();
+      allow write: if isAdmin();
+    }
+  }
+}

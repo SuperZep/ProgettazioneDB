@@ -155,6 +155,17 @@
   .certificate.c-sql .frame{border-color:#065f46}
   .certificate.c-sql .c-kicker,.certificate.c-sql .c-name{color:#065f46}
   .certificate.c-sql .c-seal{background:radial-gradient(circle at 35% 30%,#34d399,#065f46);box-shadow:0 0 0 .5cqw #d1fae5}
+  /* ---------- CLASSI / SCADENZE ---------- */
+  .banner.dl{border-color:#0369a1;background:rgba(56,189,248,.08)}
+  .class-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px;margin:18px 0}
+  .class-btn{font-size:1.15rem;font-weight:700;padding:16px 0}
+  .sel{width:auto;flex:0 0 auto;padding:8px 10px}
+  select.sel{cursor:pointer}
+  .dl-form{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
+  .chip .x{background:none;border:0;color:var(--muted);cursor:pointer;padding:0 0 0 4px;font-size:.8rem}
+  .chip .x:hover{color:var(--ko)}
+  .dlrow .n{color:#7dd3fc}
+  details.cls-mgmt > summary{cursor:pointer;font-weight:700;font-size:1.05rem}
   /* ---------- VERIFICA / RIPASSO ---------- */
   .stat .v.warn{color:var(--warn)}
   .banner.warn{border-color:#92400e;background:rgba(245,158,11,.08)}
@@ -308,7 +319,10 @@ const CONFIG = {
   PASS_THRESHOLD: 60,                             // % minima nella verifica finale per il certificato
   EXAM:   { ITEMS_PER_LEVEL: 3, ATTEMPTS: 2, COOLDOWN_HOURS: 48 },  // verifica finale: 9 schermate × 3 = 27 elementi; 2 tentativi a 48 ore di distanza
   REVIEW: { DAYS: [1, 3], TO_MASTER: 2, SESSION_MAX: 12 },          // ripasso: un errore torna dopo 1 giorno, poi dopo 3; esce dopo 2 risposte giuste di fila
-  ALLOWED_DOMAIN: '',                             // es. 'scuola.edu.it' → solo account della scuola. Vuoto = qualsiasi account Google
+  ALLOWED_DOMAIN: '',
+  DEFAULT_CLASSES: ['3A','3B','4A','4B','5A','5B'],  // classi iniziali: il docente le modifica dal pannello
+  FUNCTIONS_REGION: 'europe-west1',                   // dove girano le Cloud Functions che correggono la verifica
+  SERVER_GRADING: 'auto',                             // 'auto' = usa la correzione sul server se è stata attivata; false = mai                             // es. 'scuola.edu.it' → solo account della scuola. Vuoto = qualsiasi account Google
   SCHOOL: 'ITES Valturio — Rimini',
   TEACHER: 'Prof. Giuseppe Magnani',
   /* Incolla qui la configurazione web di Firebase (Console → Impostazioni progetto → Le tue app → Web).
@@ -1237,29 +1251,44 @@ function statusOf(d){
   return computeStats(d).attempts ? 'in_corso' : 'nuovo';
 }
 /* Un gioco "a contenitori" sorteggiato per ogni livello, con ITEMS_PER_LEVEL elementi sorteggiati */
+const WRITE_POINTS = 2;   // una query scritta nella verifica vale 2 punti
+const pick = a => a[Math.floor(Math.random()*a.length)];
 function buildExam(){
   const games = LEVELS.map(lv => {
     const pool = lv.games.filter(g => g.type !== 'order' && g.type !== 'write' && g.exam !== false);
-    const g = pool[Math.floor(Math.random()*pool.length)];
+    const g = pick(pool);
     return {id:g.id, items: sampleItems({...g, show:CONFIG.EXAM.ITEMS_PER_LEVEL}).map(it => it.id)};
   });
+  /* query da scrivere: livelli diversi, scelti a caso tra quelli che ne hanno */
+  const wl = shuffle(LEVELS.filter(l => l.games.some(g => g.type === 'write'))).slice(0, COURSE.examWrite || 0)
+             .sort((a,b) => a.id - b.id);
+  for(const l of wl) games.push({id: pick(l.games.filter(g => g.type === 'write')).id, write:true});
   return {startedAt:nowISO(), step:0, games, answers:{}};
 }
 function examGameData(eg){
   const g = gameById(eg.id);
+  if(eg.write) return normalize(g);
   return {...g, items: shuffle(eg.items.map(iid => g.items.find(it => it.id === iid)))};
 }
-function scoreExam(ex){
-  let correct = 0; const wrong = [], all = [];
+/* Correzione: 1 punto per elemento, WRITE_POINTS per ogni query scritta (provata anche sui dati nascosti) */
+async function scoreExam(ex){
+  let correct = 0, total = 0; const wrong = [], all = [], writeRes = {};
   for(const eg of ex.games){
     const g = gameById(eg.id), ans = ex.answers[eg.id] || {};
+    if(eg.write){
+      const key = eg.id+'|*'; all.push(key); total += WRITE_POINTS;
+      let r; try{ r = await checkQuery(g, ans.sql || ''); }catch(e){ r = {ok:false, msg:'Motore SQL non disponibile.'}; }
+      writeRes[eg.id] = {ok:r.ok, msg:r.msg};
+      if(r.ok) correct += WRITE_POINTS; else wrong.push(key);
+      continue;
+    }
     for(const iid of eg.items){
       const it = g.items.find(x => x.id === iid), key = eg.id+'|'+iid;
-      all.push(key);
+      all.push(key); total++;
       if(ans[iid] === it.answer) correct++; else wrong.push(key);
     }
   }
-  return {correct, total:all.length, percent:Math.round(1000*correct/all.length)/10, wrong, all};
+  return {correct, total, percent:Math.round(1000*correct/total)/10, wrong, all, writeRes};
 }
 
 /* ---- Ripasso distanziato: una scheda per elemento sbagliato ('gioco|elemento', '*' = gioco di ordinamento intero) ---- */
@@ -2358,6 +2387,8 @@ function itError(m){
     [/has more than one primary key/, ()=>`la tabella ha più di una PRIMARY KEY`],
     [/unknown column "(\w+)" in foreign key definition/, x=>`la colonna ${x} usata nella FOREIGN KEY non è stata dichiarata`],
     [/no such table: (\S+)/, x=>`la tabella ${x} non esiste`],
+    [/ambiguous column name: (\S+)/, x=>`nome di colonna ambiguo: ${x} esiste in più tabelle, scrivi Tabella.${x}`],
+    [/misuse of aggregate/, ()=>`funzione di aggregazione usata nel posto sbagliato (nel WHERE? usa HAVING)`],
     [/no such column: (\S+)/, x=>`la colonna ${x} non esiste`],
     [/table (\w+) has (\d+) columns but (\d+) values were supplied/, (t,a,b)=>`la tabella ${t} ha ${a} colonne ma hai indicato ${b} valori`],
     [/near "(.*)": syntax error/, x=>`errore di sintassi vicino a «${x}»`],
@@ -2391,7 +2422,10 @@ INSERT INTO Fattura VALUES (501,101,'2026-09-16',22.50), (502,103,'2026-10-06',5
 const AZ_DATA_HIDDEN = `INSERT INTO Cliente VALUES (9,'Arancio srl','Rimini','arancio@mail.it'), (10,'Lilla sas','Riccione',NULL);
 INSERT INTO Prodotto VALUES (19,'Gomma',0.50,0), (20,'Righello',1.10,30);
 UPDATE Prodotto SET giacenza = 0 WHERE id_prodotto = 15;
-UPDATE Cliente SET citta = 'Rimini' WHERE id_cliente = 8;`;
+UPDATE Cliente SET citta = 'Rimini' WHERE id_cliente = 8;
+INSERT INTO Ordine VALUES (107,9,'2026-10-15'), (108,5,'2026-10-16');
+INSERT INTO RigaOrdine VALUES (107,20,10,1.10), (108,13,100,0.80), (108,10,2,4.50);
+INSERT INTO Fattura VALUES (504,108,'2026-10-17',89.00);`;
 
 const L3_COUNT = [{id:'z',label:'Nessuna riga'},{id:'o',label:'1 riga'},{id:'t',label:'2 righe'},{id:'m',label:'3 righe o più'}];
 const LEVEL_SQL_3 = {
@@ -2576,15 +2610,20 @@ function resultTableHTML(r, max = 12){
 
 /* ---------- Gioco "scrivi la query" ---------- */
 function renderWrite(top){
-  const g = state.data, W = state.write, solvedNow = !!W.res?.ok;
+  const g = state.data, W = state.write, solvedNow = !!W.res?.ok, exam = state.mode === 'exam';
   let btns;
-  if(solvedNow) btns = state.mode==='review'
+  if(exam){
+    const last = state.exam.step === state.exam.games.length-1;
+    btns = `<button class="btn primary" data-act="examConfirm">${last ? '✓ Conferma e consegna' : 'Conferma e continua →'}</button>`;
+  }
+  else if(solvedNow) btns = state.mode==='review'
     ? `<button class="btn primary" data-act="reviewNext">Avanti →</button>`
     : `<button class="btn primary" data-act="next">${state.trainingJustDone ? '🎯 Vai alla verifica finale' : 'Avanti →'}</button>`;
   else btns = `<button class="btn primary" data-act="writeCheck" ${W.busy?'disabled':''}>${W.busy ? '⏳ Verifico…' : '✓ Verifica'}</button>
       ${g.hint && !W.showHint ? '<button class="btn" data-act="writeHint">💡 Suggerimento</button>' : ''}
       ${W.tries >= 3 && !W.showSol ? '<button class="btn" data-act="writeSolution">👀 Mostra una soluzione</button>' : ''}`;
-  const msg = solvedNow ? `<span class="ok">✔ ${W.res.msg}</span>`
+  const msg = exam ? `Scrivi la query che produce il <b>risultato atteso</b>. Vale <b>${WRITE_POINTS} punti</b>: viene corretta alla consegna, anche sui dati nascosti. Nessuna verifica intermedia.`
+    : solvedNow ? `<span class="ok">✔ ${W.res.msg}</span>`
     : W.res ? `<span class="ko">✘ Non ancora.</span> Leggi l’indicazione qui sotto, correggi e verifica di nuovo.`
     : `Scrivi la query che produce il <b>risultato atteso</b>. Puoi verificare tutte le volte che vuoi (Ctrl+Invio).`;
   let fb = '';
@@ -2601,7 +2640,7 @@ function renderWrite(top){
       <div class="prompt">${g.prompt}</div>
       ${vizHTML(g.id)}
       <div class="expect"><div class="fb-h">🎯 Risultato atteso</div><div id="expected">${W.expected ? resultTableHTML(W.expected) : '<div class="legend">⏳ Calcolo il risultato…</div>'}</div></div>
-      <textarea id="sqlw" class="sqlin" spellcheck="false" ${solvedNow ? 'readonly' : ''} placeholder="SELECT …">${esc(W.text)}</textarea>
+      <textarea id="sqlw" class="sqlin" spellcheck="false" ${solvedNow && !exam ? 'readonly' : ''} placeholder="SELECT …">${esc(W.text)}</textarea>
       <div class="result"><div class="msg">${msg}</div><div class="actions">${btns}</div></div>
       ${fb}
       ${W.showHint ? `<div class="fb"><div class="fb-h">💡 Suggerimento</div><p style="color:var(--txt)">${esc(g.hint)}</p></div>` : ''}
@@ -2650,6 +2689,327 @@ async function doWriteCheck(){
 
 LEVEL_SQL_3.games.find(g => g.id === 's3.4').items.forEach(it => { it.label += '\n' + it.sql; });
 LEVELS_SQL.push(LEVEL_SQL_3);
+/* ---------- Livelli 4-6 di SQL Quest ---------- */
+const JOIN_COUNT = [{id:'a',label:'0–4 righe'},{id:'b',label:'5–8 righe'},{id:'c',label:'9–20 righe'},{id:'d',label:'più di 20 righe'}];
+const LEVEL_SQL_4 = {
+  id:4, title:'Rimettere insieme i pezzi (JOIN)', icon:'🔗',
+  theory:`
+    <p>Con la normalizzazione (livello 8 di DB Quest) i dati sono stati divisi in più tabelle collegate da chiavi esterne. Con <b>JOIN</b> si rimettono insieme.</p>
+    <pre class="sql ex">SELECT Ordine.id_ordine, Ordine.data, Cliente.ragione_sociale
+FROM Ordine
+JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente;   -- FK = PK</pre>
+    <ul>
+      <li><b>JOIN … ON</b> abbina le righe delle due tabelle che soddisfano la condizione: quasi sempre <b>chiave esterna = chiave primaria</b>.</li>
+      <li>Se una colonna esiste in entrambe le tabelle va scritta come <b>Tabella.colonna</b>; altrimenti il database segnala un nome <i>ambiguo</i>.</li>
+      <li>La JOIN “normale” (<b>INNER JOIN</b>) tiene solo le righe che trovano una coppia: un cliente senza ordini sparisce.</li>
+      <li><b>LEFT JOIN</b> tiene <b>tutte</b> le righe della tabella di sinistra; dove manca la coppia mette NULL. Con <code class="ic">WHERE … IS NULL</code> trovi ciò che manca (clienti mai serviti, ordini non fatturati).</li>
+      <li>Più tabelle si collegano con più JOIN, seguendo le frecce delle chiavi esterne.</li>
+      <li>Senza la condizione ON ogni riga viene abbinata a ogni riga dell’altra tabella (<b>prodotto cartesiano</b>): quasi sempre è un errore.</li>
+    </ul>
+    <p class="tip">💡 Ogni condizione ON corrisponde a una freccia dello schema logico. Se non sai come collegare due tabelle, guarda lo schema.</p>`,
+  games:[
+    { id:'s4.1', type:'bucket', show:6,
+      prompt:'Per ogni richiesta, quale <b>condizione ON</b> collega le tabelle giuste?',
+      buckets:[{id:'oc',label:'Ordine.id_cliente = Cliente.id_cliente'},{id:'ro',label:'RigaOrdine.id_ordine = Ordine.id_ordine'},
+               {id:'rp',label:'RigaOrdine.id_prodotto = Prodotto.id_prodotto'},{id:'fo',label:'Fattura.id_ordine = Ordine.id_ordine'}],
+      items:[
+        {id:'o1',label:'Gli ordini con il nome del cliente',answer:'oc',why:'Ordine punta a Cliente con id_cliente.'},
+        {id:'o2',label:'Per ogni ordine, il cliente che l’ha fatto',answer:'oc',why:'Ordine → Cliente.'},
+        {id:'o3',label:'Ogni ordine con le sue righe',answer:'ro',why:'RigaOrdine punta a Ordine con id_ordine.'},
+        {id:'o4',label:'Le righe d’ordine con la descrizione del prodotto',answer:'rp',why:'RigaOrdine punta a Prodotto con id_prodotto.'},
+        {id:'o5',label:'Quanti pezzi di ogni prodotto (con descrizione) sono stati venduti',answer:'rp',why:'Servono righe e prodotti.'},
+        {id:'o6',label:'Le fatture con la data dell’ordine',answer:'fo',why:'Fattura punta a Ordine con id_ordine.'},
+        {id:'o7',label:'Quali ordini sono stati fatturati',answer:'fo',why:'Si abbinano fatture e ordini.'},
+        {id:'o8',label:'In quali ordini compare la riga con 200 pezzi',answer:'ro',why:'Si abbinano righe e ordini.'}
+      ]},
+    { id:'s4.2', type:'bucket', show:6,
+      prompt:'Serve una <b>JOIN</b> normale (solo le righe con una coppia) o una <b>LEFT JOIN</b> (tutte le righe di sinistra, anche senza coppia)?',
+      buckets:[{id:'i',label:'JOIN (INNER)'},{id:'l',label:'LEFT JOIN'}],
+      items:[
+        {id:'l1',label:'Tutti i clienti con i loro eventuali ordini',answer:'l',why:'“Tutti”: anche chi non ha ordini.'},
+        {id:'l2',label:'Solo i clienti che hanno ordinato, con i loro ordini',answer:'i',why:'Chi non ha ordini non deve comparire.'},
+        {id:'l3',label:'I prodotti mai venduti',answer:'l',why:'LEFT JOIN + IS NULL: si cerca ciò che non ha coppia.'},
+        {id:'l4',label:'Gli ordini con il nome del cliente',answer:'i',why:'Ogni ordine ha sempre un cliente.'},
+        {id:'l5',label:'Gli ordini non ancora fatturati',answer:'l',why:'LEFT JOIN Fattura + IS NULL.'},
+        {id:'l6',label:'Le fatture con la ragione sociale del cliente',answer:'i',why:'Ogni fattura ha un ordine e un cliente.'},
+        {id:'l7',label:'Il catalogo completo, con le eventuali vendite',answer:'l',why:'“Completo”: anche i prodotti mai venduti.'},
+        {id:'l8',label:'Le righe d’ordine con la descrizione del prodotto',answer:'i',why:'Ogni riga ha sempre un prodotto.'}
+      ]},
+    { id:'s4.3', type:'run', base:'full', kind:'count', code:true, show:6,
+      prompt:'<b>Quante righe</b> restituisce ogni JOIN? Ci sono 8 clienti, 7 ordini, 9 prodotti e 11 righe d’ordine; 3 clienti non hanno mai ordinato.',
+      buckets:JOIN_COUNT,
+      items:[
+        {id:'j1',label:'SELECT * FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente',answer:'b',why:'Ogni ordine trova il suo cliente: 7 righe, una per ordine.'},
+        {id:'j2',label:'SELECT * FROM Cliente, Ordine',answer:'d',why:'Senza condizione: prodotto cartesiano 8 × 7 = 56 righe.'},
+        {id:'j3',label:'SELECT * FROM Cliente LEFT JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente',answer:'c',why:'7 coppie + 3 clienti senza ordini (con NULL) = 10.'},
+        {id:'j4',label:'SELECT * FROM RigaOrdine JOIN Prodotto ON RigaOrdine.id_prodotto = Prodotto.id_prodotto',answer:'c',why:'Ogni riga d’ordine trova il suo prodotto: 11.'},
+        {id:'j5',label:'SELECT * FROM Ordine JOIN Fattura ON Fattura.id_ordine = Ordine.id_ordine',answer:'a',why:'Solo i 4 ordini fatturati.'},
+        {id:'j6',label:'SELECT * FROM Ordine LEFT JOIN Fattura ON Fattura.id_ordine = Ordine.id_ordine',answer:'b',why:'Tutti i 7 ordini, quelli non fatturati con NULL.'},
+        {id:'j7',label:'SELECT * FROM Cliente LEFT JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente WHERE Ordine.id_ordine IS NULL',answer:'a',why:'Restano solo i 3 clienti senza ordini.'},
+        {id:'j8',label:"SELECT * FROM Cliente JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente WHERE citta = 'Rimini'",answer:'a',why:'I clienti di Rimini con ordini sono Bianchi (2) e Gialli (2): 4 righe.'},
+        {id:'j9',label:'SELECT * FROM Prodotto LEFT JOIN RigaOrdine ON RigaOrdine.id_prodotto = Prodotto.id_prodotto',answer:'c',why:'11 righe vendute + l’Evidenziatore mai venduto = 12.'},
+        {id:'j10',label:'SELECT * FROM Prodotto, RigaOrdine',answer:'d',why:'Prodotto cartesiano: 9 × 11 = 99 righe.'}
+      ]},
+    { id:'s4.4', type:'order', code:true,
+      prompt:'Ricomponi la query: <b>ragione sociale e data degli ordini dei clienti di Rimini, dal più recente</b>. Il risultato atteso è nell’immagine.',
+      explain:'Prima SELECT e FROM, poi la JOIN con la sua condizione ON, poi il filtro WHERE e infine l’ordinamento.',
+      items:[
+        'SELECT Cliente.ragione_sociale, Ordine.data',
+        'FROM Ordine',
+        'JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente',
+        "WHERE Cliente.citta = 'Rimini'",
+        'ORDER BY Ordine.data DESC;'
+      ]},
+    { id:'s4.5', type:'run', base:'full', kind:'goal', code:true, show:6,
+      prompt:'Ogni query ha un <b>obiettivo</b> (🎯). La query fa davvero quello che serve?',
+      buckets:[{id:'ok',label:'✔ Fa quello che serve'},{id:'ko',label:'✘ Sbagliata'}],
+      items:[
+        {id:'q1',label:'🎯 ogni ordine con il nome del cliente',sql:'SELECT Ordine.id_ordine, ragione_sociale FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente',answer:'ok',why:'La condizione collega FK e PK.'},
+        {id:'q2',label:'🎯 ogni ordine con il nome del cliente',sql:'SELECT Ordine.id_ordine, ragione_sociale FROM Ordine, Cliente',answer:'ko',why:'Manca la condizione: 56 righe, ogni ordine con tutti i clienti.'},
+        {id:'q3',label:'🎯 ogni ordine con il nome del cliente',sql:'SELECT Ordine.id_ordine, ragione_sociale FROM Ordine JOIN Cliente ON Ordine.id_ordine = Cliente.id_cliente',answer:'ko',why:'Collega le colonne sbagliate (id_ordine con id_cliente): nessuna riga.'},
+        {id:'q4',label:'🎯 clienti che non hanno mai ordinato',sql:'SELECT ragione_sociale FROM Cliente LEFT JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente WHERE Ordine.id_ordine IS NULL',answer:'ok',why:'LEFT JOIN + IS NULL trova chi non ha coppia.'},
+        {id:'q5',label:'🎯 clienti che non hanno mai ordinato',sql:'SELECT ragione_sociale FROM Cliente JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente WHERE Ordine.id_ordine IS NULL',answer:'ko',why:'Con la JOIN normale i clienti senza ordini spariscono prima del WHERE: nessuna riga.'},
+        {id:'q6',label:'🎯 numero, data e cliente di ogni ordine',sql:'SELECT id_ordine, data, id_cliente FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente',answer:'ko',why:'id_cliente esiste in entrambe le tabelle: va scritto Ordine.id_cliente (nome ambiguo).'},
+        {id:'q7',label:'🎯 righe d’ordine con la descrizione del prodotto',sql:'SELECT id_ordine, descrizione, quantita FROM RigaOrdine JOIN Prodotto ON RigaOrdine.id_prodotto = Prodotto.id_prodotto',answer:'ok',why:'Colonne non ambigue, condizione corretta.'},
+        {id:'q8',label:'🎯 ordini non ancora fatturati',sql:'SELECT Ordine.id_ordine FROM Ordine LEFT JOIN Fattura ON Fattura.id_ordine = Ordine.id_ordine WHERE Fattura.id_fattura IS NULL',answer:'ok',why:'LEFT JOIN + IS NULL: gli ordini senza fattura.'}
+      ]},
+    { id:'s4.6', type:'write', starter:'SELECT ',
+      prompt:'✍️ Scrivi la query: <b>numero e data di ogni ordine, con la ragione sociale del cliente</b>.',
+      solution:'SELECT Ordine.id_ordine, Ordine.data, Cliente.ragione_sociale FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente',
+      hint:'FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente; nel SELECT tre colonne.'},
+    { id:'s4.7', type:'write', starter:'SELECT ',
+      prompt:'✍️ Scrivi la query: <b>ragione sociale dei clienti che non hanno mai fatto ordini</b>.',
+      solution:'SELECT Cliente.ragione_sociale FROM Cliente LEFT JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente WHERE Ordine.id_ordine IS NULL',
+      hint:'Parti da Cliente con LEFT JOIN Ordine e tieni le righe in cui l’ordine è NULL.'},
+    { id:'s4.8', type:'write', starter:'SELECT ',
+      prompt:'✍️ Scrivi la query: <b>data dell’ordine, descrizione del prodotto e quantità</b> di tutto ciò che hanno ordinato <b>i clienti di Rimini</b>.',
+      solution:"SELECT Ordine.data, Prodotto.descrizione, RigaOrdine.quantita FROM Cliente JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente JOIN RigaOrdine ON RigaOrdine.id_ordine = Ordine.id_ordine JOIN Prodotto ON Prodotto.id_prodotto = RigaOrdine.id_prodotto WHERE Cliente.citta = 'Rimini'",
+      hint:'Segui le frecce: Cliente → Ordine → RigaOrdine → Prodotto, con tre JOIN, poi WHERE sulla città.'}
+  ]
+};
+
+const VAL_COUNT = [{id:'v2',label:'2'},{id:'v5',label:'5'},{id:'v6',label:'6'},{id:'v7',label:'7'},{id:'v8',label:'8'}];
+const ROW_COUNT = [{id:'r1',label:'1 riga'},{id:'r2',label:'2 righe'},{id:'r5',label:'5 righe'},{id:'r7',label:'7 righe'}];
+const LEVEL_SQL_5 = {
+  id:5, title:'Riassumere i dati (GROUP BY)', icon:'📈',
+  theory:`
+    <p>Le <b>funzioni di aggregazione</b> riassumono molte righe in un solo valore; con <b>GROUP BY</b> si calcola un riassunto per ogni gruppo.</p>
+    <pre class="sql ex">SELECT citta, COUNT(*) AS n_clienti   -- un valore per gruppo
+FROM Cliente
+WHERE email IS NOT NULL                -- filtra le righe (prima)
+GROUP BY citta                         -- un gruppo per città
+HAVING COUNT(*) > 1                    -- filtra i gruppi (dopo)
+ORDER BY n_clienti DESC;</pre>
+    <ul>
+      <li><b>COUNT(*)</b> conta le righe; <b>COUNT(colonna)</b> non conta i NULL; <b>COUNT(DISTINCT colonna)</b> conta i valori diversi.</li>
+      <li><b>SUM</b> somma, <b>AVG</b> fa la media, <b>MIN</b> e <b>MAX</b> trovano il valore più piccolo e più grande.</li>
+      <li>Si può aggregare un calcolo: <code class="ic">SUM(quantita * prezzo_unitario)</code> è il totale di un ordine.</li>
+      <li>Senza GROUP BY il risultato è <b>una sola riga</b>. Con GROUP BY c’è <b>una riga per ogni gruppo</b>.</li>
+      <li>Nel SELECT, accanto alle funzioni, vanno solo le colonne del GROUP BY.</li>
+      <li><b>WHERE</b> filtra le righe prima di formare i gruppi; <b>HAVING</b> filtra i gruppi già calcolati (si può usare COUNT, SUM…).</li>
+      <li><b>AS</b> dà un nome alla colonna calcolata, che si può usare anche nell’ORDER BY.</li>
+    </ul>
+    <p class="tip">💡 È la parte di SQL più vicina all’economia aziendale: fatturato per cliente, pezzi venduti per prodotto, ordini per città.</p>`,
+  games:[
+    { id:'s5.1', type:'bucket', show:7,
+      prompt:'Quale <b>funzione</b> serve per rispondere a ogni domanda?',
+      buckets:[{id:'c',label:'COUNT'},{id:'s',label:'SUM'},{id:'a',label:'AVG'},{id:'mn',label:'MIN'},{id:'mx',label:'MAX'}],
+      items:[
+        {id:'f1',label:'Quanti clienti ci sono?',answer:'c',why:'Contare le righe: COUNT(*).'},
+        {id:'f2',label:'Quanto è stato fatturato in tutto?',answer:'s',why:'Somma dei totali: SUM(totale).'},
+        {id:'f3',label:'Qual è il prezzo medio dei prodotti?',answer:'a',why:'Media: AVG(prezzo).'},
+        {id:'f4',label:'Quanto costa il prodotto più economico?',answer:'mn',why:'Il valore più piccolo: MIN(prezzo).'},
+        {id:'f5',label:'Qual è la data dell’ordine più recente?',answer:'mx',why:'La data più grande: MAX(data).'},
+        {id:'f6',label:'Quanti pezzi sono stati venduti in tutto?',answer:'s',why:'Somma delle quantità: SUM(quantita).'},
+        {id:'f7',label:'Quanti ordini ha fatto ogni cliente?',answer:'c',why:'COUNT(*) con GROUP BY cliente.'},
+        {id:'f8',label:'Qual è la fattura più alta?',answer:'mx',why:'MAX(totale).'},
+        {id:'f9',label:'Qual è la giacenza media in magazzino?',answer:'a',why:'AVG(giacenza).'},
+        {id:'f10',label:'Qual è la prima data in cui è stato fatto un ordine?',answer:'mn',why:'La data più piccola: MIN(data).'}
+      ]},
+    { id:'s5.2', type:'bucket', show:6,
+      prompt:'La condizione va nel <b>WHERE</b> (filtra le righe, prima dei gruppi) o nell’<b>HAVING</b> (filtra i gruppi già calcolati)?',
+      buckets:[{id:'w',label:'WHERE'},{id:'h',label:'HAVING'}],
+      items:[
+        {id:'h1',label:'Solo i clienti di Rimini',answer:'w',why:'È una condizione sulla singola riga.'},
+        {id:'h2',label:'Solo i clienti con almeno 2 ordini',answer:'h',why:'Serve il conteggio del gruppo: HAVING COUNT(*) >= 2.'},
+        {id:'h3',label:'Solo i prodotti con prezzo maggiore di 10 €',answer:'w',why:'Condizione sulla riga del prodotto.'},
+        {id:'h4',label:'Solo gli ordini dal 1° ottobre',answer:'w',why:'Condizione sulla data di ogni ordine.'},
+        {id:'h5',label:'Solo i prodotti venduti in più di 20 pezzi in totale',answer:'h',why:'Serve la somma del gruppo: HAVING SUM(quantita) > 20.'},
+        {id:'h6',label:'Solo le città con più di un cliente',answer:'h',why:'Serve il conteggio per città.'},
+        {id:'h7',label:'Solo le righe d’ordine con più di 5 pezzi',answer:'w',why:'Condizione sulla singola riga.'},
+        {id:'h8',label:'Solo i clienti che hanno speso più di 50 €',answer:'h',why:'Serve la somma per cliente.'}
+      ]},
+    { id:'s5.3', type:'run', base:'full', kind:'value', code:true, show:6,
+      prompt:'Che <b>numero</b> restituisce ogni query? Guarda i dati nell’immagine.',
+      buckets:VAL_COUNT,
+      items:[
+        {id:'c1',label:'SELECT COUNT(*) FROM Cliente',answer:'v8',why:'8 clienti.'},
+        {id:'c2',label:'SELECT COUNT(email) FROM Cliente',answer:'v6',why:'COUNT(colonna) non conta i NULL: 2 clienti non hanno email.'},
+        {id:'c3',label:'SELECT COUNT(*) FROM Ordine',answer:'v7',why:'7 ordini.'},
+        {id:'c4',label:'SELECT COUNT(DISTINCT citta) FROM Cliente',answer:'v5',why:'Città diverse: Rimini, Cesena, Riccione, Bologna, Pesaro.'},
+        {id:'c5',label:'SELECT COUNT(DISTINCT id_cliente) FROM Ordine',answer:'v5',why:'I clienti diversi che hanno ordinato: 1, 2, 3, 4, 7.'},
+        {id:'c6',label:'SELECT COUNT(*) FROM Prodotto WHERE giacenza = 0',answer:'v2',why:'Cucitrice ed Evidenziatore.'},
+        {id:'c7',label:'SELECT COUNT(*) FROM Ordine WHERE id_cliente = 4',answer:'v2',why:'Gialli snc ha fatto 2 ordini.'},
+        {id:'c8',label:"SELECT COUNT(*) FROM Cliente WHERE citta = 'Rimini' OR citta = 'Cesena'",answer:'v5',why:'3 di Rimini + 2 di Cesena.'}
+      ]},
+    { id:'s5.4', type:'run', base:'full', kind:'rows', code:true, show:6,
+      prompt:'<b>Quante righe</b> (cioè quanti gruppi) restituisce ogni query?',
+      buckets:ROW_COUNT,
+      items:[
+        {id:'g1',label:'SELECT citta, COUNT(*) FROM Cliente GROUP BY citta',answer:'r5',why:'Una riga per ognuna delle 5 città.'},
+        {id:'g2',label:'SELECT id_cliente, COUNT(*) FROM Ordine GROUP BY id_cliente',answer:'r5',why:'Una riga per ognuno dei 5 clienti che hanno ordinato.'},
+        {id:'g3',label:'SELECT id_cliente, COUNT(*) FROM Ordine GROUP BY id_cliente HAVING COUNT(*) >= 2',answer:'r2',why:'Solo Bianchi e Gialli hanno 2 ordini.'},
+        {id:'g4',label:'SELECT COUNT(*) FROM Ordine',answer:'r1',why:'Senza GROUP BY il risultato è sempre una sola riga.'},
+        {id:'g5',label:'SELECT citta, COUNT(*) FROM Cliente GROUP BY citta HAVING COUNT(*) > 1',answer:'r2',why:'Rimini (3) e Cesena (2).'},
+        {id:'g6',label:'SELECT id_ordine, SUM(quantita) FROM RigaOrdine GROUP BY id_ordine',answer:'r7',why:'Una riga per ognuno dei 7 ordini.'},
+        {id:'g7',label:'SELECT MAX(prezzo) FROM Prodotto',answer:'r1',why:'Una funzione senza GROUP BY: una riga.'}
+      ]},
+    { id:'s5.5', type:'order', code:true,
+      prompt:'Ricomponi la query: <b>per ogni cliente con almeno 2 ordini, ragione sociale e numero di ordini, dal più attivo</b>.',
+      explain:'L’ordine delle clausole è fisso: SELECT, FROM, JOIN, GROUP BY, HAVING, ORDER BY. HAVING viene dopo GROUP BY perché filtra i gruppi.',
+      items:[
+        'SELECT Cliente.ragione_sociale, COUNT(*) AS n_ordini',
+        'FROM Ordine',
+        'JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente',
+        'GROUP BY Cliente.ragione_sociale',
+        'HAVING COUNT(*) >= 2',
+        'ORDER BY n_ordini DESC;'
+      ]},
+    { id:'s5.6', type:'write', starter:'SELECT ',
+      prompt:'✍️ Scrivi la query: <b>città e numero di clienti</b> per ogni città.',
+      solution:'SELECT citta, COUNT(*) FROM Cliente GROUP BY citta',
+      hint:'COUNT(*) nel SELECT e GROUP BY citta.'},
+    { id:'s5.7', type:'write', starter:'SELECT ',
+      prompt:'✍️ Scrivi la query: per ogni ordine, <b>numero dell’ordine e importo totale</b> (somma di quantità × prezzo unitario delle sue righe).',
+      solution:'SELECT id_ordine, SUM(quantita * prezzo_unitario) FROM RigaOrdine GROUP BY id_ordine',
+      hint:'Lavora su RigaOrdine: SUM(quantita * prezzo_unitario) raggruppando per id_ordine.'},
+    { id:'s5.8', type:'write', starter:'SELECT ', ordered:true,
+      prompt:'✍️ Scrivi la query: <b>ragione sociale e totale speso</b> dai clienti che hanno speso <b>più di 50 €</b>, <b>dal più alto</b>. (Il totale speso è la somma di quantità × prezzo unitario di tutte le righe dei suoi ordini.)',
+      solution:'SELECT Cliente.ragione_sociale, SUM(RigaOrdine.quantita * RigaOrdine.prezzo_unitario) AS totale FROM Cliente JOIN Ordine ON Ordine.id_cliente = Cliente.id_cliente JOIN RigaOrdine ON RigaOrdine.id_ordine = Ordine.id_ordine GROUP BY Cliente.ragione_sociale HAVING totale > 50 ORDER BY totale DESC',
+      hint:'Cliente → Ordine → RigaOrdine con due JOIN; GROUP BY ragione sociale; HAVING sulla somma; ORDER BY … DESC.'}
+  ]
+};
+
+const LEVEL_SQL_6 = {
+  id:6, title:'BOSS SQL — Il gestionale dell’azienda', icon:'👑',
+  theory:`
+    <p>Il gestionale di <i>Adriatica Forniture</i> deve rispondere alle domande di magazzino, amministrazione e direzione. Ogni domanda è una query.</p>
+    <ol>
+      <li><b>Che cosa devo mostrare?</b> → le colonne del SELECT.</li>
+      <li><b>Dove si trovano i dati?</b> → le tabelle, collegate con JOIN seguendo le chiavi esterne.</li>
+      <li><b>Quali righe mi interessano?</b> → WHERE (oppure LEFT JOIN + IS NULL per ciò che manca).</li>
+      <li><b>Serve un riassunto?</b> → funzioni di aggregazione, GROUP BY e HAVING.</li>
+      <li><b>In che ordine e quante?</b> → ORDER BY (con un secondo criterio per le parità) e LIMIT.</li>
+    </ol>
+    <p class="tip">💡 Costruisci la query un pezzo alla volta e prova spesso: prima FROM e JOIN, controlla il risultato, poi aggiungi filtri e raggruppamenti. Nel 🧪 Laboratorio puoi sperimentare liberamente.</p>`,
+  games:[
+    { id:'s6.1', type:'bucket', show:6,
+      prompt:'Per ogni domanda del direttore, qual è la <b>tecnica principale</b> che serve?',
+      buckets:[{id:'w',label:'Una tabella + WHERE'},{id:'j',label:'JOIN tra tabelle'},{id:'g',label:'Raggruppare (GROUP BY)'},{id:'n',label:'Cercare ciò che manca (LEFT JOIN + IS NULL)'}],
+      items:[
+        {id:'b1',label:'Prodotti sotto scorta (giacenza minore di 10)',answer:'w',why:'Basta Prodotto con un filtro.'},
+        {id:'b2',label:'Gli ordini con il nome del cliente',answer:'j',why:'I dati sono in due tabelle collegate.'},
+        {id:'b3',label:'Il numero di ordini di ogni cliente',answer:'g',why:'Un conteggio per ogni cliente.'},
+        {id:'b4',label:'I clienti mai serviti',answer:'n',why:'Clienti senza ordini: LEFT JOIN + IS NULL.'},
+        {id:'b5',label:'Gli ordini senza fattura',answer:'n',why:'Ordini senza coppia in Fattura.'},
+        {id:'b6',label:'Il totale dei pezzi venduti per ogni prodotto',answer:'g',why:'Una somma per prodotto.'},
+        {id:'b7',label:'Le fatture con la ragione sociale del cliente',answer:'j',why:'Fattura → Ordine → Cliente.'},
+        {id:'b8',label:'Le email dei clienti di Cesena',answer:'w',why:'Basta Cliente con un filtro.'}
+      ]},
+    { id:'s6.2', type:'write', starter:'SELECT ', ordered:true,
+      prompt:'🚚 <b>Magazzino</b> — Scrivi la query: <b>descrizione e giacenza dei prodotti da riordinare</b> (giacenza minore di 10), dal meno disponibile; a parità di giacenza, in ordine alfabetico.',
+      solution:'SELECT descrizione, giacenza FROM Prodotto WHERE giacenza < 10 ORDER BY giacenza, descrizione',
+      hint:'ORDER BY con due criteri: prima giacenza, poi descrizione.'},
+    { id:'s6.3', type:'write', starter:'SELECT ',
+      prompt:'🧾 <b>Amministrazione</b> — Scrivi la query: <b>numero degli ordini non ancora fatturati</b>, con la <b>ragione sociale</b> del cliente.',
+      solution:'SELECT Ordine.id_ordine, Cliente.ragione_sociale FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente LEFT JOIN Fattura ON Fattura.id_ordine = Ordine.id_ordine WHERE Fattura.id_fattura IS NULL',
+      hint:'JOIN con Cliente per il nome, LEFT JOIN con Fattura e WHERE … IS NULL.'},
+    { id:'s6.4', type:'write', starter:'SELECT ', ordered:true,
+      prompt:'📍 <b>Direzione commerciale</b> — Scrivi la query: per ogni <b>città</b>, il <b>numero di ordini</b> ricevuti dai suoi clienti, dalla città con più ordini; a parità, in ordine alfabetico.',
+      solution:'SELECT Cliente.citta, COUNT(*) AS n_ordini FROM Ordine JOIN Cliente ON Ordine.id_cliente = Cliente.id_cliente GROUP BY Cliente.citta ORDER BY n_ordini DESC, Cliente.citta',
+      hint:'JOIN Ordine–Cliente, GROUP BY città, COUNT(*), ORDER BY con due criteri.'},
+    { id:'s6.5', type:'write', starter:'SELECT ', ordered:true,
+      prompt:'🏆 <b>Vendite</b> — Scrivi la query: <b>descrizione e pezzi venduti in totale dei 3 prodotti più venduti</b>, dal più venduto.',
+      solution:'SELECT Prodotto.descrizione, SUM(RigaOrdine.quantita) AS pezzi FROM RigaOrdine JOIN Prodotto ON Prodotto.id_prodotto = RigaOrdine.id_prodotto GROUP BY Prodotto.descrizione ORDER BY pezzi DESC LIMIT 3',
+      hint:'SUM(quantita) raggruppando per prodotto, ORDER BY … DESC e LIMIT 3.'},
+    { id:'s6.6', type:'write', starter:'SELECT ', ordered:true,
+      prompt:'💶 <b>Fatturato</b> — Scrivi la query: <b>ragione sociale e totale fatturato</b> (somma dei totali delle sue fatture) per ogni cliente che ha almeno una fattura, dal più alto.',
+      solution:'SELECT Cliente.ragione_sociale, SUM(Fattura.totale) AS fatturato FROM Fattura JOIN Ordine ON Ordine.id_ordine = Fattura.id_ordine JOIN Cliente ON Cliente.id_cliente = Ordine.id_cliente GROUP BY Cliente.ragione_sociale ORDER BY fatturato DESC',
+      hint:'Fattura → Ordine → Cliente con due JOIN, SUM(Fattura.totale), GROUP BY ragione sociale.'}
+  ]
+};
+LEVEL_SQL_4.games.find(g => g.id === 's4.5').items.forEach(it => { it.label += '\n' + it.sql; });
+LEVELS_SQL.push(LEVEL_SQL_4, LEVEL_SQL_5, LEVEL_SQL_6);
+UPCOMING_SQL.length = 0;
+
+/* ---------- Illustrazioni livelli 4-6 ---------- */
+const T_ORDINI_FULL = {n:'Ordine',cols:['#id_ordine','>id_cliente','data'],rows:[
+  ['100','1','2026-09-01'],['101','1','2026-09-15'],['102','2','2026-10-02'],['103','3','2026-10-05'],['104','4','2026-10-06'],['105','7','2026-10-10'],['106','4','2026-10-12']]};
+const T_RIGHE_FULL = {n:'RigaOrdine',cols:['#>id_ordine','#>id_prodotto','quantita','prezzo_unitario'],rows:[
+  ['100','10','10','4.50'],['100','11','1','39.90'],['101','10','5','4.50'],['102','12','2','12.00'],['103','13','50','0.80'],['103','15','4','3.90'],
+  ['104','16','1','18.50'],['104','10','20','4.50'],['105','17','2','59.90'],['105','11','1','39.90'],['106','18','200','0.60']]};
+const T_FATTURE_FULL = {n:'Fattura',cols:['#id_fattura','>id_ordine','data','totale'],rows:[
+  ['500','100','2026-09-02','84.90'],['501','101','2026-09-16','22.50'],['502','103','2026-10-06','55.60'],['503','105','2026-10-11','159.70']]};
+const VIZ_CO = {type:'tables', w:900, h:260, tall:true, tables:[{...T_CLIENTI_FULL, x:10, y:14}, {...T_ORDINI_FULL, x:470, y:14}]};
+const VIZ_FULL = {type:'tables', w:1120, h:560, tall:true, tables:[
+  {...T_CLIENTI_FULL, x:10, y:14}, {...T_PRODOTTI_FULL, x:470, y:14},
+  {...T_ORDINI_FULL, x:10, y:300}, {...T_RIGHE_FULL, x:300, y:300}, {...T_FATTURE_FULL, x:720, y:300}]};
+Object.assign(VIZ_SQL, {
+  L4:{type:'tables', w:580, h:300,
+    tables:[{n:'Cliente',x:10,y:44,cols:['#id_cliente','ragione_sociale'],rows:[['1','Bianchi srl'],['2','Verdi spa'],['5','!Rosa & Figli']]},
+            {n:'Ordine',x:340,y:44,cols:['#id_ordine','>id_cliente','data'],rows:[['100','1','09-01'],['101','1','09-15'],['102','2','10-02']]},
+            {n:'Risultato della JOIN',x:120,y:196,cols:['id_ordine','data','ragione_sociale'],rows:[['100','09-01','Bianchi srl'],['101','09-15','Bianchi srl'],['102','10-02','Verdi spa']]}],
+    links:[{from:'Ordine.id_cliente',to:'Cliente.id_cliente',label:'ON'}],
+    arrows:[{x1:300,y1:150,x2:300,y2:190,t:'JOIN'}],
+    cap:'Ogni ordine viene abbinato alla riga del cliente con lo stesso id_cliente. Rosa & Figli (in rosso) non ha ordini: con la JOIN sparisce, con una LEFT JOIN resterebbe con NULL.'},
+  's4.1':{...VIZ_AZ_SCHEMA, cap:'Ogni freccia dello schema è una possibile condizione ON: chiave esterna = chiave primaria.'},
+  's4.2':{type:'tables', w:520, h:150,
+    tables:[{n:'Cliente LEFT JOIN Ordine',x:60,y:14,cols:['ragione_sociale','id_ordine'],rows:[['Bianchi srl','100'],['Bianchi srl','101'],['Verdi spa','102'],['Rosa & Figli','!NULL']]}],
+    cap:'LEFT JOIN tiene anche le righe senza coppia e mette NULL (in rosso). La JOIN normale le avrebbe scartate.'},
+  's4.3':{type:'flow', h:160,
+    nodes:[{i:'🔗',t:'JOIN … ON',s:'una riga per ogni coppia che combacia'},{i:'⬅️',t:'LEFT JOIN',s:'in più le righe di sinistra senza coppia'},{i:'✖️',t:'Senza ON',s:'ogni riga con ogni riga: righe × righe'}],
+    arrows:false, cap:'Per contare le righe di una JOIN, conta le coppie che combaciano.'},
+  's4.4':{type:'tables', w:440, h:150,
+    tables:[{n:'Risultato atteso',x:60,y:14,cols:['ragione_sociale','data'],rows:[['Gialli snc','2026-10-12'],['Gialli snc','2026-10-06'],['Bianchi srl','2026-09-15'],['Bianchi srl','2026-09-01']]}],
+    cap:'Il risultato che la query deve produrre: gli ordini dei clienti di Rimini, dal più recente.'},
+  's4.5':{...VIZ_CO, cap:'Clienti e ordini: la JOIN abbina id_cliente di Ordine a id_cliente di Cliente.'},
+  's4.6':{...VIZ_CO, cap:'Clienti e ordini: id_cliente (in arancio) è la chiave esterna da usare nella condizione ON.'},
+  's4.7':{...VIZ_CO, cap:'Quali clienti non compaiono mai nella colonna id_cliente di Ordine?'},
+  's4.8':{...VIZ_AZ_SCHEMA, cap:'Il percorso da seguire: Cliente → Ordine → RigaOrdine → Prodotto. Tre frecce, tre JOIN.'},
+  L5:{type:'tables', w:620, h:250, tall:true,
+    tables:[{n:'Cliente',x:10,y:14,cols:['ragione_sociale','citta'],rows:[['Bianchi srl','^Rimini'],['Verdi spa','Cesena'],['Gialli snc','^Rimini'],['Blu Ufficio srl','^Rimini'],['Celeste coop','Cesena'],['Rosa & Figli','Bologna']]},
+            {n:'Risultato',x:380,y:60,tag:'GROUP BY citta',cols:['citta','COUNT(*)'],rows:[['^Rimini','^3'],['Cesena','2'],['Bologna','1']]}],
+    arrows:[{x1:270,y1:110,x2:365,y2:110,t:'raggruppa'}],
+    cap:'GROUP BY mette insieme le righe con la stessa città (in giallo il gruppo di Rimini) e per ogni gruppo calcola COUNT(*): una riga per gruppo.'},
+  's5.1':{type:'tables', w:640, h:130,
+    tables:[{n:'Libro',x:10,y:14,tag:'esempio guida',cols:['titolo','pagine'],rows:[['Atlante','120'],['Ricettario','300'],['Diario','180']]},
+            {n:'Risultato',x:250,y:30,cols:['COUNT(*)','SUM(pagine)','AVG(pagine)','MIN(pagine)','MAX(pagine)'],rows:[['3','600','200','120','300']]}],
+    cap:'Esempio guida: le cinque funzioni applicate alla colonna pagine di tre libri.'},
+  's5.2':{type:'flow', h:160,
+    nodes:[{i:'📦',t:'FROM / JOIN',s:'le righe di partenza'},{i:'🔍',t:'WHERE',s:'filtra le righe'},{i:'🧺',t:'GROUP BY',s:'forma i gruppi'},{i:'🎯',t:'HAVING',s:'filtra i gruppi'},{i:'↕️',t:'ORDER BY',s:'ordina'}],
+    cap:'L’ordine in cui il database lavora: WHERE agisce prima dei gruppi, HAVING dopo.'},
+  's5.3':{...VIZ_FULL, cap:'Tutti i dati dell’azienda: contali tu prima di guardare la risposta del database.'},
+  's5.4':{...VIZ_FULL, cap:'Con GROUP BY c’è una riga per ogni valore diverso della colonna di raggruppamento.'},
+  's5.5':{type:'tables', w:420, h:110,
+    tables:[{n:'Risultato atteso',x:60,y:14,cols:['ragione_sociale','n_ordini'],rows:[['Gialli snc','2'],['Bianchi srl','2']]}],
+    cap:'Il risultato che la query deve produrre: i clienti con almeno 2 ordini.'},
+  's5.6':{...VIZ_CLIENTI, cap:'La tabella Cliente: quanti clienti ha ogni città?'},
+  's5.7':{type:'tables', w:820, h:300, tall:true, tables:[{...T_RIGHE_FULL, x:10, y:14}],
+    cap:'Le righe d’ordine: l’importo di una riga è quantita × prezzo_unitario; il totale dell’ordine è la somma delle sue righe.'},
+  's5.8':{...VIZ_AZ_SCHEMA, cap:'Cliente → Ordine → RigaOrdine: due JOIN, poi un gruppo per cliente.'},
+  L6:{type:'flow', h:170,
+    nodes:[{i:'❓',t:'La domanda',s:'che cosa mostro?'},{i:'🗺️',t:'Le tabelle',s:'JOIN lungo le frecce'},{i:'🔍',t:'Le righe',s:'WHERE / IS NULL'},{i:'🧺',t:'Il riassunto',s:'GROUP BY / HAVING'},{i:'↕️',t:'Ordine e limite',s:'ORDER BY / LIMIT'}],
+    cap:'Il metodo per trasformare una domanda aziendale in una query.'},
+  's6.1':{type:'flow', arrows:false, h:160,
+    nodes:[{i:'🔍',t:'WHERE',s:'filtrare una tabella'},{i:'🔗',t:'JOIN',s:'unire tabelle collegate'},{i:'🧺',t:'GROUP BY',s:'un riassunto per gruppo'},{i:'🕳️',t:'LEFT JOIN + IS NULL',s:'trovare ciò che manca'}],
+    cap:'Le quattro mosse principali di SQL Quest.'},
+  's6.2':{...VIZ_PRODOTTI, cap:'Il magazzino: guarda la colonna giacenza.'},
+  's6.3':{...VIZ_AZ_SCHEMA, cap:'Ordine → Cliente per il nome; Fattura → Ordine per sapere se è fatturato.'},
+  's6.4':{...VIZ_AZ_SCHEMA, cap:'La città è in Cliente, gli ordini in Ordine.'},
+  's6.5':{...VIZ_AZ_SCHEMA, cap:'I pezzi venduti sono in RigaOrdine, la descrizione in Prodotto.'},
+  's6.6':{...VIZ_AZ_SCHEMA, cap:'Il percorso: Fattura → Ordine → Cliente.'}
+});
+
 
 /* =========================================================================
    2d) I CORSI
@@ -2663,14 +3023,14 @@ const COURSES = {
   sql:{ id:'sql', coll:'students_sql', icon:'🧮', short:'SQL Quest', title:'SQL Quest — Interrogare un database',
         subtitle:'Dal CREATE TABLE alle query sul database di un’azienda: ordini, fatture, magazzino',
         tagline:'Comandi SQL veri, eseguiti nel browser · laboratorio · ripasso degli errori',
-        levels:LEVELS_SQL, viz:VIZ_SQL, examEnabled:false, upcoming:UPCOMING_SQL, sql:true, recommends:'db',
-        certMeta:n => `${n} giochi: CREATE TABLE, vincoli, INSERT, UPDATE, DELETE, interrogazioni` }
+        levels:LEVELS_SQL, viz:VIZ_SQL, examEnabled:true, examWrite:3, upcoming:UPCOMING_SQL, sql:true, recommends:'db',
+        certMeta:n => `6 livelli · ${n} giochi: CREATE TABLE e vincoli, INSERT/UPDATE/DELETE, SELECT, JOIN, GROUP BY, query scritte e corrette sul database` }
 };
 function initCourseGlobals(id){
   COURSE = COURSES[id]; LEVELS = COURSE.levels; VIZ = COURSE.viz;
   ALL_GAMES = LEVELS.flatMap(l => l.games.map(g => ({...g, level:l.id, levelTitle:l.title})));
   TOTAL = ALL_GAMES.length;
-  EXAM_ITEMS = LEVELS.length * CONFIG.EXAM.ITEMS_PER_LEVEL;
+  EXAM_ITEMS = LEVELS.length * CONFIG.EXAM.ITEMS_PER_LEVEL + (COURSE.examWrite||0) * WRITE_POINTS;   // punti totali della verifica
 }
 initCourseGlobals('db');
 /* Riepilogo di un corso per la schermata di scelta (senza cambiare corso attivo) */
@@ -2708,7 +3068,14 @@ async function makeFirebaseBackend(cfg){
     async load(coll,uid){ const s = await F.getDoc(F.doc(db,coll,uid)); return s.exists() ? s.data() : null; },
     async save(coll,uid,data){ await F.setDoc(F.doc(db,coll,uid), data); },
     async list(coll){ const q = await F.getDocs(F.collection(db,coll)); return q.docs.map(d=>({uid:d.id, ...d.data()})); },
-    async remove(coll,uid){ await F.deleteDoc(F.doc(db,coll,uid)); }
+    async remove(coll,uid){ await F.deleteDoc(F.doc(db,coll,uid)); },
+    async getConfig(){ const s = await F.getDoc(F.doc(db,'config','settings')); return s.exists() ? s.data() : null; },
+    async call(name, data){
+      const Fn = await import(base+'firebase-functions.js');
+      const r = await Fn.httpsCallable(Fn.getFunctions(app, CONFIG.FUNCTIONS_REGION), name, {timeout:60000})(data);
+      return r.data;
+    },
+    async saveConfig(c){ await F.setDoc(F.doc(db,'config','settings'), c); }
   };
 }
 
@@ -2730,7 +3097,9 @@ function makeLocalBackend(){
     async load(coll,uid){ return (rd(KEY(coll))||{})[uid] || null; },
     async save(coll,uid,data){ const db=rd(KEY(coll))||{}; db[uid]=data; wr(KEY(coll),db); },
     async list(coll){ return Object.entries(rd(KEY(coll))||{}).map(([uid,d])=>({uid,...d})); },
-    async remove(coll,uid){ const db=rd(KEY(coll))||{}; delete db[uid]; wr(KEY(coll),db); }
+    async remove(coll,uid){ const db=rd(KEY(coll))||{}; delete db[uid]; wr(KEY(coll),db); },
+    async getConfig(){ return rd('dbquest.demo.config'); },
+    async saveConfig(c){ wr('dbquest.demo.config', c); }
   };
 }
 
@@ -2748,14 +3117,14 @@ function authError(e){
    ========================================================================= */
 const state = {
   screen:'loading', fatal:'', loginError:'',
-  user:null, role:null, student:null, course:'db', docs:{}, lab:null, labBack:'home',
+  user:null, role:null, student:null, course:'db', docs:{}, lab:null, labBack:'home', settings:null, classe:null,
   mode:'practice',                  // 'practice' (allenamento) | 'exam' (verifica finale) | 'review' (ripasso)
   level:0, game:0, data:null, loc:{}, selected:null, checked:false, score:0,
   trainingJustDone:false,
   exam:null, examResult:null, review:null,
   unlockAll:false, previewSolved:new Set(),
   certFor:null, certBack:'home', theory:null, seenTheory:new Set(),
-  admin:{rows:[], q:'', sort:'name', dir:1, detail:null, loading:false}
+  admin:{rows:[], q:'', sort:'name', dir:1, detail:null, loading:false, classe:''}
 };
 
 let saveChain = Promise.resolve();
@@ -2789,6 +3158,7 @@ function renderScreen(){
   if(s==='loading') $('#app').innerHTML = `<div class="login card"><div class="logo">⏳</div><div class="sub">Caricamento…</div></div>`;
   else if(s==='login') renderLogin();
   else if(s==='courses') renderCourses();
+  else if(s==='classPick') renderClassPick();
   else if(s==='lab') renderLab();
   else if(s==='home') renderHome();
   else if(s==='game') renderGame();
@@ -2806,7 +3176,7 @@ function topbar(){
   const ini = (u.name||u.email||'?').trim().split(/\s+/).map(s=>s[0]).slice(0,2).join('').toUpperCase();
   const av = u.photo ? `<img src="${esc(u.photo)}" alt="" referrerpolicy="no-referrer">` : esc(ini);
   let nav = '';
-  if(state.screen !== 'courses'){
+  if(state.screen !== 'courses' && state.screen !== 'classPick'){
     nav = `<span class="pill course-pill">${COURSE.icon} ${esc(COURSE.short)}</span><button class="btn" data-act="courses">⇄ Corsi</button>`;
     if(admin) nav += state.screen==='admin'
       ? `<button class="btn" data-act="preview">🎮 Anteprima corso</button>`
@@ -2816,6 +3186,7 @@ function topbar(){
     <div class="who"><div class="avatar">${av}</div>
       <div style="min-width:0"><div class="nm">${esc(u.name)}</div><div class="em">${esc(u.email)}</div></div>
       <span class="badge ${admin?'admin':'student'}">${admin?'Docente':'Studente'}</span>
+      ${!admin && state.classe ? `<span class="badge student">🏫 ${esc(state.classe)}</span>` : ''}
       ${backend?.mode==='demo' ? '<span class="badge demo">Demo</span>' : ''}
     </div>
     <div class="actions">${nav}<button class="btn" data-act="logout">Esci</button></div>
@@ -2869,7 +3240,7 @@ function examBanner(d, e){
       ${COURSE.sql ? '<button class="btn" data-act="lab">🧪 Apri il laboratorio</button>' : ''}</div>`;
   return `<div class="banner"><div class="grow">🏋️ <b>I livelli sono allenamento</b>: puoi sbagliare e riprovare quanto vuoi, gli errori <b>non contano per il voto</b>.
       Prima di ogni livello trovi la teoria, dopo ogni errore la spiegazione, e ciò che sbagli torna nel <b>ripasso</b> nei giorni successivi.
-      Completa tutti i ${TOTAL} giochi per sbloccare la <b>verifica finale</b> (${EXAM_ITEMS} elementi, almeno il ${CONFIG.PASS_THRESHOLD}% per il certificato).</div></div>`;
+      Completa tutti i ${TOTAL} giochi per sbloccare la <b>verifica finale</b> (${EXAM_ITEMS} punti, almeno il ${CONFIG.PASS_THRESHOLD}% per il certificato).</div></div>`;
 }
 function reviewBanner(r){
   if(r.due) return `<div class="banner warn"><div class="grow">🔁 <b>${r.due}</b> element${r.due===1?'o':'i'} da ripassare oggi.
@@ -2895,18 +3266,18 @@ function renderHome(){
       ['Consolidati nel ripasso', d.reviewMastered||0, d.reviewMastered ? 'good' : ''],
       ['Verifica finale', 'in arrivo']
     ]);
-    banner = examBanner(d, e) + reviewBanner(r);
+    banner = deadlineBanners(d) + examBanner(d, e) + reviewBanner(r);
     const lbl = {soon:'🚧 arriverà con i prossimi livelli', passed:'✔ superata', running:'in corso', ready:'disponibile', cooldown:'riprova dal '+fmtDate(e.nextAt), exhausted:'tentativi esauriti', locked:'🔒 completa l’allenamento'}[e.st];
     examCard = `<div class="lvl exam ${e.st==='locked'||e.st==='soon'?'locked':''} ${e.st==='passed'?'done':''}" data-act="examIntro">
         <div class="ic">🎯</div><div class="tt">Verifica finale</div>
-        <div class="mt">${e.st==='soon' ? lbl : `${EXAM_ITEMS} elementi · soglia ${CONFIG.PASS_THRESHOLD}% · ${lbl}`}</div></div>`;
+        <div class="mt">${e.st==='soon' ? lbl : `${EXAM_ITEMS} punti · soglia ${CONFIG.PASS_THRESHOLD}% · ${lbl}`}</div></div>`;
   } else {
     banner = `<div class="banner admin"><div class="grow">👁 <b>Anteprima docente</b>: puoi provare giochi e verifica, nulla viene salvato.</div>
       <button class="btn sm" data-act="toggleUnlock">${state.unlockAll?'🔒 Blocca livelli':'🔓 Sblocca tutti i livelli'}</button>
       <button class="btn sm" data-act="resetPreview">↺ Azzera anteprima</button>
       <button class="btn sm" data-act="examIntro">🎯 Prova la verifica</button></div>`;
     examCard = `<div class="lvl exam ${COURSE.examEnabled?'':'locked'}" data-act="examIntro"><div class="ic">🎯</div><div class="tt">Verifica finale</div>
-        <div class="mt">${COURSE.examEnabled ? `${EXAM_ITEMS} elementi · soglia ${CONFIG.PASS_THRESHOLD}% · anteprima` : '🚧 arriverà con i prossimi livelli'}</div></div>`;
+        <div class="mt">${COURSE.examEnabled ? `${EXAM_ITEMS} punti · soglia ${CONFIG.PASS_THRESHOLD}% · anteprima` : '🚧 arriverà con i prossimi livelli'}</div></div>`;
   }
 
   const cards = LEVELS.map((lv,i)=>{
@@ -3122,13 +3493,14 @@ function renderExamIntro(){
       <h1>Verifica finale</h1>
       <div class="sub">È l’unica prova che conta per il certificato.</div>
       <ul class="rules">
-        <li><b>${LEVELS.length} schermate</b>, una per livello, con ${per} elementi ciascuna: <b>${EXAM_ITEMS} elementi</b> sorteggiati a caso.</li>
+        <li><b>${LEVELS.length} schermate</b>, una per livello, con ${per} elementi sorteggiati a caso (1 punto ciascuno)${COURSE.examWrite ? `, più <b>${COURSE.examWrite} query da scrivere</b> (${WRITE_POINTS} punti ciascuna, corrette anche sui dati nascosti)` : ''}: <b>${EXAM_ITEMS} punti</b> in tutto.</li>
         <li><b>Nessuna spiegazione durante la verifica</b>: risposte corrette e spiegazioni le vedi tutte alla fine.</li>
         <li>Ogni schermata si conferma <b>una sola volta</b>: non si torna indietro.</li>
-        <li>Punteggio = risposte corrette ÷ ${EXAM_ITEMS}. Serve almeno il <b>${CONFIG.PASS_THRESHOLD}%</b> per il certificato.</li>
+        <li>Punteggio = punti ottenuti ÷ ${EXAM_ITEMS}. Serve almeno il <b>${CONFIG.PASS_THRESHOLD}%</b> per il certificato.</li>
         <li>Hai <b>${nAtt} tentativi</b>; tra un tentativo e l’altro devi aspettare <b>${h} ore</b>. Il tentativo conta appena inizi.</li>
         <li>Se chiudi la pagina, la verifica riprende dalla schermata a cui eri arrivato.</li>
         <li>Gli elementi sbagliati finiscono nel ripasso.</li>
+        ${state.serverGrading ? '<li>🛡️ Domande e correzione sono gestite dal server della scuola.</li>' : ''}
       </ul>
       ${!admin && e.st!=='passed' ? `<div class="sub">Tentativi rimasti: <b>${e.left}</b> di ${examAllowed(d)}</div>` : ''}
       ${r.due && (e.st==='ready') ? `<div class="banner warn" style="text-align:left"><div class="grow">🔁 Hai <b>${r.due}</b> element${r.due===1?'o':'i'} da ripassare: conviene farlo prima di iniziare.</div><button class="btn" data-act="startReview">Ripassa prima</button></div>` : ''}
@@ -3139,9 +3511,16 @@ function renderExamIntro(){
 }
 
 /* ---------- VERIFICA FINALE: risultato + revisione ---------- */
-function examReviewHTML(ex){
+function examReviewHTML(ex, writeRes = {}){
   return ex.games.map((eg,k)=>{
     const g = gameById(eg.id), ans = ex.answers[eg.id] || {};
+    if(eg.write){
+      const r = writeRes[eg.id] || {};
+      return `<div class="rv-g"><div class="rv-p"><span class="pill">${k+1}/${ex.games.length} · Livello ${g.level} · ${WRITE_POINTS} punti</span> ${g.prompt}</div>
+        <div class="legend" style="margin:0">La tua query:</div><pre class="sql">${esc(ans.sql || '(nessuna)')}</pre>
+        <p style="margin:8px 0 4px">${r.ok ? '✅ Corretta' : '❌ ' + (r.msg || 'Non corretta')}</p>
+        ${r.ok ? '' : `<div class="legend" style="margin:0">Una soluzione possibile:</div><pre class="sql">${esc(g.solution)}</pre>`}</div>`;
+    }
     const lbl = id => g.buckets.find(b=>b.id===id)?.label || '—';
     const lis = eg.items.map(iid=>{
       const it = g.items.find(x=>x.id===iid), ok = ans[iid] === it.answer;
@@ -3166,11 +3545,11 @@ function renderExamResult(){
       <div class="emo">${pass ? '🏆' : '📉'}</div>
       <h1>${pass ? 'Verifica superata!' : 'Verifica non superata'}</h1>
       <div class="big ${pass?'ok':'ko'}">${fmtPct(R.percent)}</div>
-      <div class="sub">${R.correct} risposte corrette su ${R.total} · soglia ${CONFIG.PASS_THRESHOLD}%${admin ? ' · 👁 anteprima, non salvata' : ''}</div>
+      <div class="sub">${R.correct} punti su ${R.total} · soglia ${CONFIG.PASS_THRESHOLD}%${admin ? ' · 👁 anteprima, non salvata' : ''}</div>
       ${wrong && !admin ? `<div class="sub">I ${wrong} elementi sbagliati sono stati aggiunti al <b>ripasso</b>.</div>` : ''}
       <div class="actions" style="justify-content:center;margin-bottom:12px">${pass||admin ? after : ''}<button class="btn" data-act="home">Torna ai livelli</button></div>
       ${!pass && !admin ? after : ''}
-      <details class="rv" ${pass ? '' : 'open'}><summary>📋 Rivedi le risposte (${wrong} error${wrong===1?'e':'i'})</summary>${examReviewHTML(R.exam)}</details>
+      <details class="rv" ${pass ? '' : 'open'}><summary>📋 Rivedi le risposte (${wrong} error${wrong===1?'e':'i'})</summary>${examReviewHTML(R.exam, R.writeRes)}</details>
     </div>`;
 }
 
@@ -3218,7 +3597,7 @@ function renderCert(){
         <div class="c-meta">${esc(COURSE.certMeta(TOTAL))}</div>
         <div class="c-score">${c.legacy ? 'con un punteggio finale di' : 'superando la verifica finale con'} <b>${fmtPct(c.percent)}</b></div>
         <div class="c-meta">${c.legacy ? `Soglia minima: ${CONFIG.PASS_THRESHOLD}%`
-          : `Verifica finale: ${c.correct}/${c.total} risposte corrette · tentativo n. ${c.attempt} · soglia minima ${CONFIG.PASS_THRESHOLD}%`}</div>
+          : `Verifica finale: ${c.correct}/${c.total} punti · tentativo n. ${c.attempt} · soglia minima ${CONFIG.PASS_THRESHOLD}%`}</div>
         <div class="c-foot">
           <div style="text-align:left">Data di rilascio<b>${fmtDate(c.completedAt)}</b></div>
           <div>Codice certificato<b>${esc(c.code||'—')}</b></div>
@@ -3244,74 +3623,198 @@ const examScore = r => r.d.passed ? r.d.passed.percent : r.e.best;
 const SORTERS = {
   name:r=>(r.d.name||'').toLowerCase(), solved:r=>r.s.solved, errors:r=>r.s.errors, review:r=>r.rv.total,
   exam:r=>examScore(r) ?? -1, status:r=>['nuovo','in_corso','verifica','non_superato','superato'].indexOf(r.status),
-  lastSeen:r=>r.d.lastSeen||''
+  lastSeen:r=>r.d.lastSeen||'', classe:r=>r.d.classe||'~', dl:r=>r.dl ? (r.dl.late ? 0 : r.dl.allDone ? 2 : 1) : 3
 };
 
+/* ---------- CLASSI E SCADENZE ---------- */
+async function loadSettings(){
+  let cfg = null;
+  try{ cfg = await backend.getConfig(); }catch(e){ console.error(e); }
+  state.settings = {
+    classes: cfg?.classes?.length ? cfg.classes : [...CONFIG.DEFAULT_CLASSES],
+    deadlines: cfg?.deadlines || []
+  };
+}
+async function saveSettings(msg){
+  try{ await backend.saveConfig(JSON.parse(JSON.stringify(state.settings))); if(msg) toast(msg); }
+  catch(e){ console.error(e); toast('⚠ Salvataggio non riuscito: controlla le regole di Firestore (config).'); }
+}
+const dlLabel = dl => dl.upto === 'exam' ? 'la verifica finale' : dl.upto === 1 ? 'il livello 1' : `i livelli 1–${dl.upto}`;
+function deadlinesFor(classe, courseId = COURSE.id){
+  return (state.settings?.deadlines || [])
+    .filter(x => x.course === courseId && (x.classe === '*' || (classe && x.classe === classe)))
+    .sort((a,b) => a.due.localeCompare(b.due));
+}
+/* Stato di una scadenza per uno studente: completata? in ritardo? quanti giochi mancano? */
+function dlStatus(dl, d, courseId = COURSE.id){
+  const c = COURSES[courseId], exam = dl.upto === 'exam';
+  const games = exam ? [] : c.levels.filter(l => l.id <= dl.upto).flatMap(l => l.games);
+  const end = new Date(dl.due + 'T23:59:59').getTime(), now = Date.now();
+  let done, missing, doneAt = null;
+  if(exam){
+    const t = (d?.examAttempts || [])[0];
+    done = !!t || !!d?.passed; missing = done ? 0 : 1;
+    doneAt = t ? t.completedAt : (d?.passed?.at || null);
+  } else {
+    const solved = games.filter(g => d?.games?.[gk(g.id)]?.solved);
+    done = solved.length === games.length; missing = games.length - solved.length;
+    if(done) doneAt = solved.map(g => d.games[gk(g.id)].solvedAt || '').sort().pop() || null;
+  }
+  return {done, missing, total: exam ? 1 : games.length, late: !done && now > end,
+          doneLate: !!(done && doneAt && new Date(doneAt).getTime() > end),
+          daysLeft: Math.round((new Date(dl.due + 'T00:00:00') - new Date(new Date().toDateString())) / DAY)};
+}
+function dlSummary(d, courseId = COURSE.id){
+  const items = deadlinesFor(d?.classe, courseId).map(dl => ({dl, st: dlStatus(dl, d, courseId)}));
+  return {items, late: items.some(i => i.st.late), allDone: items.length > 0 && items.every(i => i.st.done)};
+}
+function deadlineBanners(d){
+  return dlSummary(d).items.filter(i => !i.st.done).slice(0, 2).map(({dl, st}) => {
+    const what = dl.upto === 'exam' ? 'svolgere la verifica finale' : `completare ${dlLabel(dl)}`;
+    if(st.late) return `<div class="banner ko"><div class="grow">⏰ <b>Scadenza superata</b> il ${fmtDate(dl.due)}: dovevi ${what}.
+        ${dl.upto === 'exam' ? '' : `Ti mancano <b>${st.missing}</b> giochi su ${st.total}.`} Recupera il prima possibile.</div></div>`;
+    const when = st.daysLeft <= 0 ? '<b>oggi</b>' : st.daysLeft === 1 ? '<b>domani</b>' : `tra ${st.daysLeft} giorni`;
+    return `<div class="banner dl"><div class="grow">📅 Entro il <b>${fmtDate(dl.due)}</b> (${when}): ${what}${dl.upto === 'exam' ? '' : ` — ti mancano <b>${st.missing}</b> giochi su ${st.total}`}.</div></div>`;
+  }).join('');
+}
+function renderClassPick(){
+  const classes = state.settings?.classes || [];
+  $('#app').innerHTML = topbar() + `
+    <div class="card final" style="max-width:640px">
+      <div class="emo">🏫</div>
+      <h1>In che classe sei?</h1>
+      <div class="sub">Serve al docente per seguire la tua classe e assegnare le scadenze. Si sceglie una volta sola.</div>
+      <div class="class-grid">${classes.map(c => `<button class="btn class-btn" data-act="pickClass" data-c="${esc(c)}">${esc(c)}</button>`).join('')}</div>
+      <div class="legend">La tua classe non c’è, o hai sbagliato? Chiedi al docente: può correggerla dal suo pannello.</div>
+    </div>`;
+}
+
+/* ---------- PANNELLO DOCENTE (con classi e scadenze) ---------- */
 function renderAdmin(){
-  const A = state.admin;
-  const rows = A.rows.map(d => ({d, s:computeStats(d), e:examInfo(d), rv:reviewInfo(d), status:statusOf(d)}));
+  const A = state.admin, classes = state.settings?.classes || [];
+  const all = A.rows.map(d => ({d, s:computeStats(d), e:examInfo(d), rv:reviewInfo(d), status:statusOf(d), dl:dlSummary(d)}));
+  const inClass = (r, c) => c === '—' ? !r.d.classe : r.d.classe === c;
+  const rows = all.filter(r => !A.classe || inClass(r, A.classe));
   const key = SORTERS[A.sort] || SORTERS.name;
   rows.sort((a,b)=>{ const x=key(a), y=key(b); return (x>y?1:x<y?-1:0)*A.dir; });
 
   const n = rows.length;
   const cnt = st => rows.filter(r=>r.status===st).length;
+  const late = rows.filter(r => r.dl.late).length;
   const scores = rows.map(examScore).filter(x=>x!=null);
   const avg = scores.length ? scores.reduce((a,b)=>a+b,0)/scores.length : null;
 
   const th = (k,l) => `<th data-act="sort" data-key="${k}">${l}${A.sort===k ? (A.dir>0?' ▲':' ▼') : ''}</th>`;
-  const body = rows.map(({d,s,e,rv,status})=>{
+  const dlCell = r => !r.dl.items.length ? '<span class="em">—</span>'
+    : r.dl.late ? `<span class="st non_superato">⏰ in ritardo</span>`
+    : r.dl.allDone ? `<span class="st superato">✓ in regola</span>` : `<span class="st in_corso">in corso</span>`;
+  const body = rows.map(r=>{
+    const {d,s,e,rv,status} = r;
     const sc = examScore({d,e}), pc = sc==null ? '' : sc>=CONFIG.PASS_THRESHOLD ? 'ok' : 'ko';
     return `<tr data-search="${esc(((d.name||'')+' '+(d.email||'')).toLowerCase())}">
       <td><b>${esc(d.name)}</b><div class="em">${esc(d.email)}</div></td>
+      <td>${d.classe ? esc(d.classe) : '<span class="em">—</span>'}</td>
       <td>${s.solved}/${TOTAL}<div class="mini"><i style="width:${Math.round(s.solved/TOTAL*100)}%"></i></div></td>
       <td>${s.errors}</td>
       <td>${rv.total}<div class="em">${rv.due} oggi · ${d.reviewMastered||0} consolidati</div></td>
       <td class="${pc}">${fmtPct(sc)}<div class="em">${e.used}/${examAllowed(d)} tentativi${e.st==='running'?' · in corso':''}</div></td>
+      <td>${dlCell(r)}</td>
       <td><span class="st ${status}">${STATUS_LABEL[status]}</span></td>
       <td class="em">${fmtDT(d.lastSeen)}</td>
       <td><button class="btn sm" data-act="detail" data-uid="${esc(d.uid)}">Dettaglio</button></td>
     </tr>`;
   }).join('');
 
-  // giochi più difficili in allenamento: media errori prima di risolverli
+  /* riepilogo per classe */
+  const groups = [...classes, '—'].map(c => {
+    const rs = all.filter(r => inClass(r, c)); if(!rs.length) return null;
+    const avgTr = rs.reduce((a,r)=>a + r.s.solved/TOTAL, 0) / rs.length;
+    return {c, n:rs.length, avgTr, passed:rs.filter(r=>r.status==='superato').length, late:rs.filter(r=>r.dl.late).length};
+  }).filter(Boolean);
+  const classSummary = !A.classe && groups.length ? `<div class="section"><h2>🏫 Riepilogo per classe</h2>
+    <div class="tbl-wrap"><table class="tbl res"><thead><tr><th>Classe</th><th>Studenti</th><th>Allenamento medio</th><th>Verifica superata</th><th>In ritardo</th><th></th></tr></thead>
+    <tbody>${groups.map(g=>`<tr><td><b>${g.c === '—' ? 'Senza classe' : esc(g.c)}</b></td><td>${g.n}</td>
+      <td>${Math.round(g.avgTr*100)}%<div class="mini"><i style="width:${Math.round(g.avgTr*100)}%"></i></div></td>
+      <td>${g.passed}/${g.n}</td><td class="${g.late?'ko':''}">${g.late}</td>
+      <td><button class="btn sm" data-act="filterClass" data-c="${esc(g.c)}">Apri</button></td></tr>`).join('')}</tbody></table></div></div>` : '';
+
+  /* scadenze del corso */
+  const dls = (state.settings?.deadlines || []).filter(x => x.course === COURSE.id && (!A.classe || x.classe === '*' || x.classe === A.classe))
+                .sort((a,b)=>a.due.localeCompare(b.due));
+  const dlRows = dls.map(dl => {
+    const target = all.filter(r => dl.classe === '*' || r.d.classe === dl.classe);
+    const st = target.map(r => dlStatus(dl, r.d));
+    const done = st.filter(x=>x.done).length, lateN = st.filter(x=>x.late).length;
+    const past = Date.now() > new Date(dl.due + 'T23:59:59').getTime();
+    return `<div class="h dlrow"><span class="n">${fmtDate(dl.due)}</span>
+      <span><b>${dl.classe === '*' ? 'Tutte le classi' : esc(dl.classe)}</b> · completare ${dlLabel(dl)}</span>
+      <span class="t">${done}/${target.length} in regola${lateN ? ` · <b class="ko">${lateN} in ritardo</b>` : ''}${past ? ' · scaduta' : ''}</span>
+      <button class="btn sm danger" data-act="delDeadline" data-id="${esc(dl.id)}" title="Elimina scadenza">✕</button></div>`;
+  }).join('');
+  const levelOpts = LEVELS.map(l => `<option value="${l.id}">${l.id === 1 ? 'Livello 1' : `Livelli 1–${l.id}`}</option>`).join('')
+                  + (COURSE.examEnabled ? '<option value="exam">Verifica finale svolta</option>' : '');
+  const deadlinesSection = `<div class="section"><h2>📅 Scadenze — ${esc(COURSE.short)}</h2>
+    ${dlRows ? `<div class="hard">${dlRows}</div>` : '<div class="legend">Nessuna scadenza per questo corso.</div>'}
+    <div class="dl-form">
+      <select id="dlClass" class="search sel"><option value="*">Tutte le classi</option>${classes.map(c=>`<option ${c===A.classe?'selected':''}>${esc(c)}</option>`).join('')}</select>
+      <select id="dlUpto" class="search sel">${levelOpts}</select>
+      <input id="dlDate" class="search sel" type="date" value="${new Date(Date.now()+14*DAY).toISOString().slice(0,10)}">
+      <button class="btn primary" data-act="addDeadline">＋ Aggiungi scadenza</button>
+    </div>
+    <div class="legend">Gli studenti della classe vedono la scadenza nella loro home, con i giochi che mancano; chi la supera senza aver finito risulta «in ritardo».</div></div>`;
+
+  /* gestione classi */
+  const classesSection = `<details class="section cls-mgmt"><summary>⚙️ Classi della scuola (${classes.length})</summary>
+    <div class="chips" style="margin:10px 0">${classes.map(c=>`<span class="chip">${esc(c)} <button class="x" data-act="delClass" data-c="${esc(c)}" title="Rimuovi">✕</button></span>`).join('')}</div>
+    <div class="dl-form"><input id="newClass" class="search sel" placeholder="Nuova classe, es. 4C" maxlength="12">
+      <button class="btn" data-act="addClass">＋ Aggiungi classe</button></div>
+    <div class="legend">Gli studenti scelgono la classe al primo accesso. Le classi valgono per entrambi i corsi.</div></details>`;
+
+  /* errori frequenti */
   const hardest = ALL_GAMES.map(g=>{
     let k=0, err=0;
     for(const r of rows){ const x=r.d.games?.[gk(g.id)]; if(x && x.attempts){ k++; err+=x.errors||0; } }
     return {g, k, avg: k ? err/k : 0};
   }).filter(x=>x.k && x.avg>0).sort((a,b)=>b.avg-a.avg).slice(0,6);
-
-  // elementi più sbagliati nella verifica finale
   const seen = {}, miss = {};
   for(const r of rows) for(const t of r.d.examAttempts||[]){
     (t.items||[]).forEach(k=>seen[k]=(seen[k]||0)+1);
     (t.wrong||[]).forEach(k=>miss[k]=(miss[k]||0)+1);
   }
   const hardItems = Object.keys(miss).filter(validReviewKey).map(k=>{
-    const [gid,iid] = k.split('|'), g = gameById(gid), it = g.items.find(x=>x.id===iid);
+    const [gid,iid] = k.split('|'), g = gameById(gid);
+    const it = iid === '*' ? {label: '✍️ ' + plain(g.prompt).replace(/^✍️\s*/,'').slice(0, 70), answer:null} : g.items.find(x=>x.id===iid);
     return {k, g, it, m:miss[k], s:seen[k]||miss[k]};
   }).sort((a,b)=> b.m/b.s - a.m/a.s || b.m - a.m).slice(0,8);
 
   $('#app').innerHTML = topbar() + `
     <div class="tabs">${Object.values(COURSES).map(c=>`<button class="btn sm ${c.id===COURSE.id?'primary':''}" data-act="chooseCourse" data-id="${c.id}">${c.icon} ${esc(c.short)}</button>`).join('')}</div>
-    <h1>📋 Pannello docente</h1>
-    <div class="sub">${esc(COURSE.title)} · ${COURSE.examEnabled ? `verifica finale: ${EXAM_ITEMS} elementi, ${CONFIG.EXAM.ATTEMPTS} tentativi, soglia ${CONFIG.PASS_THRESHOLD}%` : 'verifica finale in arrivo con i prossimi livelli'}</div>
+    <h1>📋 Pannello docente${A.classe ? ` · ${A.classe === '—' ? 'senza classe' : 'classe ' + esc(A.classe)}` : ''}</h1>
+    <div class="sub">${esc(COURSE.title)} · ${COURSE.examEnabled ? `verifica finale: ${EXAM_ITEMS} punti, ${CONFIG.EXAM.ATTEMPTS} tentativi, soglia ${CONFIG.PASS_THRESHOLD}%` : 'verifica finale in arrivo'}
+      · ${state.serverGrading ? '🛡️ correzione sul server attiva' : backend?.mode === 'firebase' ? '⚠️ correzione nel browser (server non attivo)' : 'modalità demo'}</div>
     ${statCards([['Studenti',n],['Non iniziato',cnt('nuovo')],['In allenamento',cnt('in_corso')],['In verifica',cnt('verifica')],
                  ['Superati',cnt('superato'),'good'],['Non superati',cnt('non_superato'),cnt('non_superato')?'bad':''],
-                 ['Media verifica',fmtPct(avg)]])}
+                 ['In ritardo',late,late?'bad':''],['Media verifica',fmtPct(avg)]])}
     <div class="toolbar">
+      <select id="classFilter" class="search sel" style="flex:0 0 auto">
+        <option value="">🏫 Tutte le classi</option>${classes.map(c=>`<option value="${esc(c)}" ${A.classe===c?'selected':''}>${esc(c)}</option>`).join('')}
+        <option value="—" ${A.classe==='—'?'selected':''}>Senza classe</option></select>
       <input class="search" id="q" placeholder="🔍 Cerca per nome o email" value="${esc(A.q)}">
       <button class="btn" data-act="refresh">↻ Aggiorna</button>
       <button class="btn" data-act="csv" ${n?'':'disabled'}>⬇ Esporta CSV</button>
     </div>
     ${A.loading ? '<div class="sub">Caricamento…</div>' : n ? `
       <div class="tbl-wrap"><table class="tbl">
-        <thead><tr>${th('name','Studente')}${th('solved','Allenamento')}${th('errors','Errori allen.')}${th('review','Ripasso')}${th('exam','Verifica')}${th('status','Stato')}${th('lastSeen','Ultima attività')}<th></th></tr></thead>
+        <thead><tr>${th('name','Studente')}${th('classe','Classe')}${th('solved','Allenamento')}${th('errors','Errori allen.')}${th('review','Ripasso')}${th('exam','Verifica')}${th('dl','Scadenze')}${th('status','Stato')}${th('lastSeen','Ultima attività')}<th></th></tr></thead>
         <tbody>${body}</tbody>
       </table></div>
-      <div class="legend">Errori allen. = errori fatti in allenamento prima di risolvere ogni gioco (non contano per il voto). Verifica = risultato del superamento o miglior tentativo.</div>` : `<div class="banner">Nessuno studente ha ancora effettuato l’accesso.</div>`}
+      <div class="legend">Errori allen. = errori fatti in allenamento prima di risolvere ogni gioco (non contano per il voto). Verifica = risultato del superamento o miglior tentativo.</div>`
+      : `<div class="banner">${A.rows.length ? 'Nessuno studente in questa classe.' : 'Nessuno studente ha ancora effettuato l’accesso.'}</div>`}
+    ${classSummary}
+    ${deadlinesSection}
     ${hardItems.length ? `<div class="section"><h2>🎯 Elementi più sbagliati nella verifica</h2><div class="hard">
       ${hardItems.map(h=>`<div class="h"><span class="n">${h.m}/${h.s}</span>
-        <span><b>${esc(h.it.label)}</b> → ${esc(h.g.buckets.find(b=>b.id===h.it.answer)?.label||'')}</span>
+        <span><b>${esc(h.it.label)}</b>${h.it.answer ? ` → ${esc((h.g.buckets||[]).find(b=>b.id===h.it.answer)?.label||'')}` : ''}</span>
         <span class="t">gioco ${h.g.id} · ${esc(h.g.levelTitle)}</span></div>`).join('')}
     </div><div class="legend">Sbagliato / proposto nelle verifiche: indica i concetti da rispiegare in classe.</div></div>` : ''}
     ${hardest.length ? `<div class="section"><h2>🔥 Giochi con più errori in allenamento</h2><div class="hard">
@@ -3320,9 +3823,53 @@ function renderAdmin(){
         <span class="t">${esc(plain(h.g.prompt).slice(0,95))}${plain(h.g.prompt).length>95?'…':''}</span>
         <span class="em" style="white-space:nowrap">${h.k} stud.</span></div>`).join('')}
     </div></div>` : ''}
+    ${classesSection}
     ${A.detail ? detailModal(A.detail) : ''}`;
   applySearch();
 }
+async function setStudentClass(uid, c){
+  try{
+    for(const course of Object.values(COURSES)){
+      const doc = await backend.load(course.coll, uid);
+      if(doc){ doc.classe = c || null; await backend.save(course.coll, uid, doc); }
+    }
+    await loadAdminRows(); render(); toast('Classe aggiornata');
+  }catch(e){ console.error(e); toast('⚠ Operazione non riuscita'); }
+}
+const CLASS_ACTIONS = {
+  pickClass(ds){
+    state.classe = ds.c;
+    for(const [id, d] of Object.entries(state.docs)){
+      if(d){ d.classe = ds.c; backend.save(COURSES[id].coll, state.user.uid, JSON.parse(JSON.stringify(d))).catch(e=>console.error(e)); }
+    }
+    state.screen = 'courses'; render();
+  },
+  filterClass(ds){ state.admin.classe = ds.c; window.scrollTo?.(0,0); render(); },
+  async addDeadline(){
+    const classe = $('#dlClass').value, upto = $('#dlUpto').value, due = $('#dlDate').value;
+    if(!due){ toast('Scegli una data.'); return; }
+    state.settings.deadlines.push({id:'dl'+Date.now().toString(36), course:COURSE.id, classe, upto: upto === 'exam' ? 'exam' : +upto, due});
+    render(); await saveSettings('Scadenza aggiunta');
+  },
+  async delDeadline(ds){
+    if(!confirm('Eliminare questa scadenza?')) return;
+    state.settings.deadlines = state.settings.deadlines.filter(x => x.id !== ds.id);
+    render(); await saveSettings('Scadenza eliminata');
+  },
+  async addClass(){
+    const c = ($('#newClass').value || '').trim().toUpperCase();
+    if(!c) return;
+    if(state.settings.classes.includes(c)){ toast('Classe già presente'); return; }
+    state.settings.classes.push(c);
+    state.settings.classes.sort((a,b)=>a.localeCompare(b,'it',{numeric:true}));
+    render(); await saveSettings('Classe aggiunta');
+  },
+  async delClass(ds){
+    if(!confirm(`Rimuovere la classe ${ds.c} dall’elenco? Gli studenti già assegnati la mantengono.`)) return;
+    state.settings.classes = state.settings.classes.filter(x => x !== ds.c);
+    render(); await saveSettings('Classe rimossa');
+  }
+};
 
 function applySearch(){
   const q = state.admin.q.trim().toLowerCase();
@@ -3345,6 +3892,12 @@ function detailModal(uid){
       <div><h2 style="margin:0">${esc(d.name)}</h2><div class="sub" style="margin:0">${esc(d.email)} · ${STATUS_LABEL[status]}</div></div>
       <button class="btn sm" data-act="closeModal">✕</button>
     </div>
+    <div class="toolbar"><label class="legend" style="margin:0">🏫 Classe:</label>
+      <select id="stuClass" data-uid="${esc(uid)}" class="search sel" style="flex:0 0 auto">
+        <option value="">— nessuna —</option>${(state.settings?.classes||[]).concat(d.classe && !(state.settings?.classes||[]).includes(d.classe) ? [d.classe] : [])
+          .map(c=>`<option ${c===d.classe?'selected':''}>${esc(c)}</option>`).join('')}</select>
+      ${dlSummary(d).items.map(({dl,st}) => `<span class="st ${st.late?'non_superato':st.done?'superato':'in_corso'}">${fmtDate(dl.due)}: ${st.done ? (st.doneLate ? '✓ in ritardo' : '✓') : st.late ? '⏰ mancano ' + st.missing : 'mancano ' + st.missing}</span>`).join(' ')}
+    </div>
     ${statCards([['Allenamento',`${s.solved}/${TOTAL}`],['Errori allen.',s.errors],['Da ripassare',`${rv.total}`],['Consolidati',d.reviewMastered||0],
                  ['Verifica',fmtPct(d.passed ? d.passed.percent : e.best)],['Tentativi',`${e.used}/${examAllowed(d)}`]])}
     <h2 style="margin-top:6px">🎯 Verifica finale</h2>
@@ -3364,11 +3917,11 @@ function detailModal(uid){
 }
 
 function exportCSV(){
-  const head = ['Nome','Email','Allenamento','Errori allenamento','Ripasso in programma','Elementi consolidati','Tentativi verifica','Verifica %','Stato','Codice certificato','Data superamento','Ultima attività'];
-  const lines = state.admin.rows.map(d=>{
+  const head = ['Nome','Email','Classe','Allenamento','Errori allenamento','Ripasso in programma','Elementi consolidati','Tentativi verifica','Verifica %','Stato','Codice certificato','Data superamento','Ultima attività'];
+  const lines = state.admin.rows.filter(d => !state.admin.classe || (state.admin.classe === '—' ? !d.classe : d.classe === state.admin.classe)).map(d=>{
     const s = computeStats(d), e = examInfo(d), rv = reviewInfo(d), st = statusOf(d);
     const pct = d.passed ? d.passed.percent : e.best;
-    return [d.name, d.email, `${s.solved}/${TOTAL}`, s.errors, rv.total, d.reviewMastered||0, `${e.used}/${examAllowed(d)}`,
+    return [d.name, d.email, d.classe||'', `${s.solved}/${TOTAL}`, s.errors, rv.total, d.reviewMastered||0, `${e.used}/${examAllowed(d)}`,
             pct==null?'':String(pct).replace('.',','), STATUS_LABEL[st], d.passed?.code||'', d.passed?fmtDT(d.passed.at):'', fmtDT(d.lastSeen)];
   });
   const csv = [head,...lines].map(r=>r.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(';')).join('\r\n');
@@ -3394,6 +3947,11 @@ function renderCourses(){
     else if(s.passed) line = `🏆 Superato con il ${fmtPct(s.passed.percent)}`;
     else if(s.started) line = `${s.solved}/${s.total} giochi completati${s.due ? ` · 🔁 ${s.due} da ripassare oggi` : ''}`;
     else line = 'Non ancora iniziato';
+    if(!admin){
+      const dlS = dlSummary(state.docs[c.id] || {classe: state.classe}, c.id);
+      if(dlS.late) line += ' · <b class="ko">⏰ scadenza superata</b>';
+      else { const next = dlS.items.find(i => !i.st.done); if(next) line += ` · 📅 scadenza ${fmtDate(next.dl.due)}`; }
+    }
     const rec = !admin && c.recommends && !courseSummary(c.recommends, state.docs[c.recommends]).passed
       ? `<div class="legend">💡 Consigliato dopo ${esc(COURSES[c.recommends].short)}, ma puoi iniziarlo quando vuoi.</div>` : '';
     const btns = admin
@@ -3606,11 +4164,33 @@ function loadExamStep(){
   state.mode = 'exam';
   setData(examGameData(ex.games[ex.step]));
 }
-function finishExam(){
-  const ex = state.exam, sc = scoreExam(ex), passed = sc.percent >= CONFIG.PASS_THRESHOLD, at = nowISO();
+async function reloadStudent(){
+  await saveChain;
+  const d = await backend.load(COURSE.coll, state.user.uid);
+  if(d){ state.student = state.docs[COURSE.id] = migrateDoc(d); }
+}
+async function finishExam(){
+  const ex = state.exam;
+  state.screen = 'loading'; render();
+  if(state.role === 'student' && state.serverGrading){     /* correzione e registrazione fatte dal server */
+    try{
+      await saveChain;
+      const r = await backend.call('submitExam', {course: COURSE.id, answers: ex.answers});
+      await reloadStudent();
+      state.examResult = {...r, exam: ex};
+      state.exam = null; state.mode = 'practice'; state.screen = 'examResult'; render();
+    }catch(err){
+      console.error(err); ex.step = ex.games.length - 1;
+      toast('⚠ Consegna non riuscita: ' + (err.message || err) + ' — riprova.');
+      loadExamStep();
+    }
+    return;
+  }
+  const sc = await scoreExam(ex), passed = sc.percent >= CONFIG.PASS_THRESHOLD, at = nowISO();
   if(state.role==='student'){
     const d = state.student, n = d.examAttempts.length + 1;
-    d.examAttempts.push({n, startedAt:ex.startedAt, completedAt:at, correct:sc.correct, total:sc.total, percent:sc.percent, passed, wrong:sc.wrong, items:sc.all});
+    d.examAttempts.push({n, startedAt:ex.startedAt, completedAt:at, correct:sc.correct, total:sc.total, percent:sc.percent, passed, wrong:sc.wrong, items:sc.all,
+                         queries:Object.fromEntries(ex.games.filter(g=>g.write).map(g=>[g.id, (ex.answers[g.id]||{}).sql || '']))});
     if(passed) d.passed = {percent:sc.percent, correct:sc.correct, total:sc.total, at, attempt:n, code:makeCode(state.user.uid+'|'+at)};
     reviewAdd(d, sc.wrong);
     d.exam = null; d.lastSeen = at;
@@ -3648,7 +4228,7 @@ const ACTIONS = {
   async logout(){
     state.admin.detail = null;
     if(state.lab?.db){ try{ state.lab.db.close(); }catch(e){} }
-    state.lab = null; state.docs = {}; state.student = null;
+    state.lab = null; state.docs = {}; state.student = null; state.classe = null; state.admin.classe = '';
     await backend.signOut();
   },
   courses(){
@@ -3660,6 +4240,7 @@ const ACTIONS = {
     setCourse(ds.id);
     if(state.role==='admin'){ state.admin.detail = null; state.admin.rows = []; state.screen = 'admin'; render(); await loadAdminRows(); render(); return; }
     const u = state.user, d = migrateDoc(state.docs[ds.id] || newStudent(u));
+    if(!d.classe && state.classe) d.classe = state.classe;
     Object.assign(d, {name:u.name, email:u.email, photo:u.photo||d.photo||null, lastSeen:nowISO()});
     state.student = state.docs[ds.id] = d; persist();
     state.screen = 'home'; render();
@@ -3715,9 +4296,22 @@ const ACTIONS = {
     if(state.role==='student' && examInfo(state.student).st==='locked'){ toast('🔒 Completa prima tutti i giochi dell’allenamento.'); return; }
     state.screen = 'examIntro'; render();
   },
-  startExam(){
+  async startExam(){
     if(state.role==='admin'){ state.exam = state.exam || buildExam(); loadExamStep(); return; }
     const d = state.student, e = examInfo(d);
+    if(state.serverGrading){                       /* le domande le sorteggia e le salva il server */
+      if(e.st==='ready' && !confirm(`Iniziare la verifica finale?\nIl tentativo viene conteggiato da subito (tentativi rimasti: ${e.left}).`)) return;
+      if(e.st!=='ready' && e.st!=='running') return;
+      state.screen = 'loading'; render();
+      try{
+        const r = await backend.call('startExam', {course: COURSE.id});
+        await reloadStudent();
+        const dr = state.student.examDraft && state.student.examDraft.startedAt === r.exam.startedAt ? state.student.examDraft : null;
+        state.exam = {...r.exam, step: dr ? dr.step : 0, answers: dr ? dr.answers : {}};
+        loadExamStep();
+      }catch(err){ console.error(err); toast('⚠ ' + (err.message || err)); state.screen = 'home'; render(); }
+      return;
+    }
     if(e.st==='ready'){
       if(!confirm(`Iniziare la verifica finale?\nIl tentativo viene conteggiato da subito (tentativi rimasti: ${e.left}).`)) return;
       d.exam = buildExam(); persist();
@@ -3726,12 +4320,19 @@ const ACTIONS = {
   },
   examConfirm(){
     const g = state.data, ex = state.exam;
-    if(g.items.some(it=>state.loc[it.id]==='pool')) return;
+    if(g.type === 'write'){
+      const sql = ($('#sqlw')?.value ?? state.write.text).trim();
+      if(!sql && !confirm('Non hai scritto nessuna query: passare comunque alla schermata successiva? Questa domanda varrà 0 punti.')) return;
+    } else if(g.items.some(it=>state.loc[it.id]==='pool')) return;
     const last = ex.step === ex.games.length-1;
     if(last && !confirm('Consegnare la verifica? Dopo la consegna vedrai il punteggio e le risposte corrette.')) return;
-    ex.answers[g.id] = Object.fromEntries(g.items.map(it => [it.id, state.loc[it.id]]));
+    ex.answers[g.id] = g.type === 'write' ? {sql: ($('#sqlw')?.value ?? state.write.text)}
+                                          : Object.fromEntries(g.items.map(it => [it.id, state.loc[it.id]]));
     ex.step++;
-    if(state.role==='student') persist();
+    if(state.role==='student'){
+      if(state.serverGrading) state.student.examDraft = {startedAt: ex.startedAt, step: ex.step, answers: ex.answers};
+      persist();
+    }
     loadExamStep();
   },
 
@@ -3767,7 +4368,7 @@ const ACTIONS = {
       c.history = [...(c.history||[]), {type:'reset', at:nowISO(), solved:computeStats(c).solved,
         exams:(c.examAttempts||[]).map(t=>({n:t.n, percent:t.percent, passed:t.passed, at:t.completedAt})),
         passed:c.passed ? {percent:c.passed.percent, at:c.passed.at, code:c.passed.code} : null}];
-      Object.assign(c, {games:{}, review:{}, reviewMastered:0, exam:null, examAttempts:[], extraAttempts:0, passed:null, cooldownResetAt:null});
+      Object.assign(c, {games:{}, review:{}, reviewMastered:0, exam:null, examDraft:null, examAttempts:[], extraAttempts:0, passed:null, cooldownResetAt:null});
       ['status','percent','certCode','completedAt','courseAttempt'].forEach(k => delete c[k]);
       return c;
     }, 'Progressi azzerati');
@@ -3787,6 +4388,11 @@ async function demoLogin(){
 }
 ACTIONS.demoLogin = demoLogin;
 document.addEventListener('submit', e => { if(e.target.id === 'demoForm'){ e.preventDefault(); demoLogin(); } });
+Object.assign(ACTIONS, CLASS_ACTIONS);
+document.addEventListener('change', e=>{
+  if(e.target.id === 'classFilter'){ state.admin.classe = e.target.value; render(); }
+  if(e.target.id === 'stuClass') setStudentClass(e.target.dataset.uid, e.target.value);
+});
 document.addEventListener('input', e=>{
   if(e.target.id === 'q'){ state.admin.q = e.target.value; applySearch(); }
   if(e.target.id === 'sqlin' && state.lab) state.lab.text = e.target.value;
@@ -3877,6 +4483,12 @@ async function handleAuth(user){
   state.loginError = '';
   state.user = user; state.role = admin ? 'admin' : 'student';
   state.screen = 'loading'; render();
+  await loadSettings();
+  state.serverGrading = false;
+  if(backend.call && CONFIG.SERVER_GRADING !== false){
+    try{ await Promise.race([backend.call('ping', {}), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 6000))]); state.serverGrading = true; }
+    catch(e){ console.info('Correzione sul server non attiva:', e.message || e); }
+  }
   if(admin){
     state.screen = 'courses';
   } else {
@@ -3885,7 +4497,8 @@ async function handleAuth(user){
       const docs = await Promise.all(ids.map(id => backend.load(COURSES[id].coll, user.uid)));
       state.docs = Object.fromEntries(ids.map((id,i) => [id, docs[i] ? migrateDoc(docs[i]) : null]));
       state.student = null;
-      state.screen = 'courses';
+      state.classe = Object.values(state.docs).map(d => d?.classe).find(Boolean) || null;
+      state.screen = state.classe ? 'courses' : 'classPick';
     }catch(e){
       console.error(e);
       state.loginError = 'Impossibile leggere i tuoi progressi (' + (e.code||e.message) + ').';

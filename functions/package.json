@@ -1,0 +1,19 @@
+{
+  "name": "dbquest-functions",
+  "private": true,
+  "description": "Correzione della verifica finale di DB Quest e SQL Quest sul server",
+  "main": "index.js",
+  "engines": { "node": "22" },
+  "scripts": {
+    "build-content": "node scripts/build-content.js",
+    "test": "node scripts/test-core.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^6.1.0",
+    "sql.js": "1.13.0"
+  },
+  "devDependencies": {
+    "jsdom": "^24.1.3"
+  }
+}
