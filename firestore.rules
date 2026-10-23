@@ -1,0 +1,25 @@
+rules_version = '2';
+// Regole Firestore per DB Quest + SQL Quest.
+// Incollale in Firebase Console → Firestore Database → Regole → Pubblica.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email == 'giuseppemagnani@gmail.com';
+    }
+
+    // Un documento per studente e per corso:
+    //   students/{uid}      → DB Quest
+    //   students_sql/{uid}  → SQL Quest
+    match /{course}/{uid} {
+      allow read:           if (course == 'students' || course == 'students_sql')
+                            && signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create, update: if (course == 'students' || course == 'students_sql')
+                            && signedIn() && (request.auth.uid == uid || isAdmin());
+      allow delete:         if (course == 'students' || course == 'students_sql') && isAdmin();
+    }
+  }
+}
