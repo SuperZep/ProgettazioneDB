@@ -1,6 +1,15 @@
 rules_version = '2';
-// Regole Firestore per DB Quest + SQL Quest.
+// Regole Firestore per DB Quest + SQL Quest — piano gratuito (Spark) con CONVALIDA DEL DOCENTE.
 // Incollale in Firebase Console → Firestore Database → Regole → Pubblica.
+//
+// Cosa garantiscono:
+//  • ogni studente legge e scrive solo i propri documenti; il docente legge e scrive tutto;
+//  • l'attestato (passed), i tentativi concessi, le convalide e lo storico li scrive SOLO il docente;
+//  • i tentativi di verifica già consegnati non si possono modificare né cancellare;
+//  • una verifica si può iniziare solo con tentativi disponibili e dopo l'attesa di 48 ore
+//    (misurata con l'orologio del server, non con quello del computer dello studente);
+//  • le domande di una verifica non si possono cambiare dopo l'inizio, e chi la abbandona non
+//    può ricominciarla da capo con domande nuove: il tentativo resta conteggiato.
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -10,16 +19,65 @@ service cloud.firestore {
         && request.auth.token.email_verified == true
         && request.auth.token.email == 'giuseppemagnani@gmail.com';
     }
+    function isCourse(c) { return c == 'students' || c == 'students_sql'; }
+
+    // Tentativi per studente (CONFIG.EXAM.ATTEMPTS) e attesa in ore (CONFIG.EXAM.COOLDOWN_HOURS)
+    function maxAttempts() { return 2 + resource.data.get('extraAttempts', 0); }
+    function cooldownOver() {
+      let t = resource.data.get('lastExamEnd', null);
+      return t == null || request.time > t + duration.value(48, 'h');
+    }
+
+    // Campi che solo il docente può scrivere
+    function adminFields() { return ['passed', 'extraAttempts', 'cooldownResetAt', 'history', 'validations', 'lastExamEnd']; }
+    function same(k) { return request.resource.data.get(k, null) == resource.data.get(k, null); }
+
+    // Primo salvataggio dello studente: nessun campo del docente, nessun tentativo, nessuna verifica in corso
+    function newDocOk() {
+      let d = request.resource.data;
+      return !d.keys().hasAny(adminFields())
+        && d.get('examAttempts', []).size() == 0
+        && d.get('exam', null) == null;
+    }
+
+    // Aggiornamento dello studente
+    function studentUpdateOk() {
+      let before = resource.data.get('exam', null);
+      let after  = request.resource.data.get('exam', null);
+      let oldA   = resource.data.get('examAttempts', []);
+      let newA   = request.resource.data.get('examAttempts', []);
+      let n      = oldA.size();
+      return same('passed') && same('extraAttempts') && same('cooldownResetAt') && same('history') && same('validations')
+        && (
+          // nessuna consegna: i tentativi restano identici
+          (newA == oldA && same('lastExamEnd') && (
+               (before == null && after == null)                                                      // allenamento, ripasso…
+            || (before == null && after != null && n < maxAttempts() && cooldownOver())               // inizio della verifica
+            || (before != null && after != null
+                && after.get('games', null) == before.get('games', null)
+                && after.get('startedAt', null) == before.get('startedAt', null))                    // verifica in corso
+          ))
+          ||
+          // consegna: esattamente un tentativo in più, con le stesse domande della verifica iniziata
+          (before != null && after == null
+            && newA.size() == n + 1
+            && newA[0:n] == oldA
+            && newA[n].get('n', 0) == n + 1
+            && newA[n].get('startedAt', null) == before.get('startedAt', null)
+            && newA[n].get('games', null) == before.get('games', null)
+            && !newA[n].keys().hasAny(['server', 'auto', 'validated'])
+            && request.resource.data.get('lastExamEnd', null) == request.time)
+        );
+    }
 
     // Un documento per studente e per corso:
     //   students/{uid}      → DB Quest
     //   students_sql/{uid}  → SQL Quest
     match /{course}/{uid} {
-      allow read:           if (course == 'students' || course == 'students_sql')
-                            && signedIn() && (request.auth.uid == uid || isAdmin());
-      allow create, update: if (course == 'students' || course == 'students_sql')
-                            && signedIn() && (request.auth.uid == uid || isAdmin());
-      allow delete:         if (course == 'students' || course == 'students_sql') && isAdmin();
+      allow read:   if isCourse(course) && signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if isCourse(course) && (isAdmin() || (signedIn() && request.auth.uid == uid && newDocOk()));
+      allow update: if isCourse(course) && (isAdmin() || (signedIn() && request.auth.uid == uid && studentUpdateOk()));
+      allow delete: if isCourse(course) && isAdmin();
     }
 
     // Impostazioni condivise (classi e scadenze): le leggono tutti gli utenti autenticati, le scrive solo il docente

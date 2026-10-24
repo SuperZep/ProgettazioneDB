@@ -322,7 +322,8 @@ const CONFIG = {
   ALLOWED_DOMAIN: '',
   DEFAULT_CLASSES: ['3A','3B','4A','4B','5A','5B'],  // classi iniziali: il docente le modifica dal pannello
   FUNCTIONS_REGION: 'europe-west1',                   // dove girano le Cloud Functions che correggono la verifica
-  SERVER_GRADING: 'auto',                             // 'auto' = usa la correzione sul server se è stata attivata; false = mai                             // es. 'scuola.edu.it' → solo account della scuola. Vuoto = qualsiasi account Google
+  SERVER_GRADING: 'auto',
+  TEACHER_VALIDATION: 'auto',   // 'auto' = con Firebase senza server, l'attestato lo rilascia il pannello docente dopo aver ricorretto la verifica                             // 'auto' = usa la correzione sul server se è stata attivata; false = mai                             // es. 'scuola.edu.it' → solo account della scuola. Vuoto = qualsiasi account Google
   SCHOOL: 'ITES Valturio — Rimini',
   TEACHER: 'Prof. Giuseppe Magnani',
   /* Incolla qui la configurazione web di Firebase (Console → Impostazioni progetto → Le tue app → Web).
@@ -1224,8 +1225,43 @@ const trainingDone = d => computeStats(d).solved === TOTAL;
 
 /* ---- Verifica finale ---- */
 const examAllowed = d => CONFIG.EXAM.ATTEMPTS + (d.extraAttempts||0);
+/* ---- Convalida del docente (piano gratuito di Firebase): lo studente consegna le risposte,
+        il pannello docente le ricorregge e rilascia l'attestato ---- */
+const ADMIN_FIELDS = ['passed','extraAttempts','cooldownResetAt','history','validations','lastExamEnd'];
+function needsValidation(){
+  const v = CONFIG.TEACHER_VALIDATION;
+  return v === true || (v === 'auto' && backend?.mode === 'firebase' && !state.serverGrading);
+}
+/* Risultato "effettivo" di un tentativo: quello ricalcolato dal docente, se c'è */
+function attemptView(d, t){
+  const v = d.validations?.[t.n];
+  if(v) return {...t, percent:v.percent, correct:v.correct, total:v.total, passed:v.passed, wrong:v.wrong || t.wrong, validated:true, v};
+  if(t.server || t.auto || !t.games) return {...t, validated:true};      // corretto dal server, in demo o versione precedente
+  return {...t, pending:true};
+}
+/* Le domande salvate sono davvero una verifica regolare di questo corso? */
+function examStructureError(ex){
+  if(!ex || !Array.isArray(ex.games)) return 'verifica mancante';
+  const buckets = ex.games.filter(g => !g.write), writes = ex.games.filter(g => g.write);
+  if(buckets.length !== LEVELS.length) return 'numero di schermate errato';
+  const lv = new Set();
+  for(const eg of buckets){
+    const g = gameById(eg.id);
+    if(!g || g.type === 'order' || g.type === 'write' || g.exam === false) return 'gioco non ammesso: ' + eg.id;
+    const L = LEVELS.find(l => l.games.some(x => x.id === g.id)); lv.add(L && L.id);
+    const items = eg.items || [];
+    if(items.length !== Math.min(CONFIG.EXAM.ITEMS_PER_LEVEL, g.items.length) || new Set(items).size !== items.length
+       || !items.every(i => g.items.some(it => it.id === i))) return 'elementi alterati in ' + eg.id;
+  }
+  if(lv.size !== LEVELS.length) return 'livelli ripetuti';
+  if(writes.length !== (COURSE.examWrite || 0)) return 'numero di query errato';
+  const wl = new Set(writes.map(eg => { const g = gameById(eg.id); return g && g.type === 'write' ? g.level : null; }));
+  if(wl.has(null) || wl.size !== writes.length) return 'query non ammesse';
+  return null;
+}
 function examInfo(d){
-  const tries = d.examAttempts || [], used = tries.length, left = Math.max(0, examAllowed(d) - used);
+  const tries = (d.examAttempts || []).map(t => attemptView(d, t)), used = tries.length, left = Math.max(0, examAllowed(d) - used);
+  const pending = tries.find(t => t.pending && t.passed) || null;
   const best = tries.reduce((m,t) => m==null || t.percent > m ? t.percent : m, null);
   const last = tries[used-1];
   let nextAt = null;
@@ -1237,11 +1273,12 @@ function examInfo(d){
   if(d.passed) st = 'passed';
   else if(!COURSE.examEnabled) st = 'soon';
   else if(d.exam) st = 'running';
+  else if(pending) st = 'pending';
   else if(!trainingDone(d)) st = 'locked';
   else if(left <= 0) st = 'exhausted';
   else if(nextAt) st = 'cooldown';
   else st = 'ready';
-  return {st, used, left, best, last, nextAt};
+  return {st, used, left, best, last, nextAt, pending, tries};
 }
 function statusOf(d){
   if(d.passed) return 'superato';
@@ -3067,6 +3104,12 @@ async function makeFirebaseBackend(cfg){
     async signOut(){ await A.signOut(auth); },
     async load(coll,uid){ const s = await F.getDoc(F.doc(db,coll,uid)); return s.exists() ? s.data() : null; },
     async save(coll,uid,data){ await F.setDoc(F.doc(db,coll,uid), data); },
+    /* aggiorna solo i campi indicati (ognuno sostituito per intero); examEnd → ora del server */
+    async patch(coll,uid,data,opts={}){
+      const d = {...data};
+      if(opts.examEnd) d.lastExamEnd = F.serverTimestamp();
+      await F.setDoc(F.doc(db,coll,uid), d, {mergeFields: Object.keys(d)});
+    },
     async list(coll){ const q = await F.getDocs(F.collection(db,coll)); return q.docs.map(d=>({uid:d.id, ...d.data()})); },
     async remove(coll,uid){ await F.deleteDoc(F.doc(db,coll,uid)); },
     async getConfig(){ const s = await F.getDoc(F.doc(db,'config','settings')); return s.exists() ? s.data() : null; },
@@ -3096,6 +3139,11 @@ function makeLocalBackend(){
     async signOut(){ wr(SES,null); cb(null); },
     async load(coll,uid){ return (rd(KEY(coll))||{})[uid] || null; },
     async save(coll,uid,data){ const db=rd(KEY(coll))||{}; db[uid]=data; wr(KEY(coll),db); },
+    async patch(coll,uid,data,opts={}){
+      const db=rd(KEY(coll))||{}; db[uid] = {...(db[uid]||{}), ...data};
+      if(opts.examEnd) db[uid].lastExamEnd = new Date().toISOString();
+      wr(KEY(coll),db);
+    },
     async list(coll){ return Object.entries(rd(KEY(coll))||{}).map(([uid,d])=>({uid,...d})); },
     async remove(coll,uid){ const db=rd(KEY(coll))||{}; delete db[uid]; wr(KEY(coll),db); },
     async getConfig(){ return rd('dbquest.demo.config'); },
@@ -3128,11 +3176,24 @@ const state = {
 };
 
 let saveChain = Promise.resolve();
-function persist(){
+function persist(opts = {}){
   if(state.role!=='student' || !state.student) return;
   const uid = state.user.uid, coll = COURSE.coll, snap = JSON.parse(JSON.stringify(state.student));
-  saveChain = saveChain.then(()=>backend.save(coll,uid,snap))
-    .catch(err=>{ console.error(err); toast('⚠ Salvataggio non riuscito: controlla la connessione e ricarica la pagina.'); });
+  /* i campi del docente (attestato, tentativi concessi, convalide…) non si riscrivono mai dal browser dello studente */
+  const guarded = backend.mode === 'firebase' && (state.serverGrading || needsValidation());
+  if(guarded) ADMIN_FIELDS.forEach(k => delete snap[k]); else delete snap.lastExamEnd;
+  saveChain = saveChain.then(()=>backend.patch(coll, uid, snap, opts))
+    .catch(err=>{
+      console.error(err);
+      if(String(err?.code||'').includes('permission-denied')){
+        toast('⚠ I tuoi dati sono stati aggiornati dal docente: li ricarico.');
+        backend.load(coll, uid).then(d => {
+          if(!d || COURSE.coll !== coll) return;
+          state.student = state.docs[COURSE.id] = migrateDoc(d);
+          if(['home','examIntro','courses','reviewEnd'].includes(state.screen)) render();
+        }).catch(e => console.error(e));
+      } else toast('⚠ Salvataggio non riuscito: controlla la connessione e ricarica la pagina.');
+    });
 }
 
 function isSolved(id){
@@ -3227,6 +3288,8 @@ function renderLogin(){
 function examBanner(d, e){
   if(e.st==='passed') return `<div class="banner ok"><div class="grow">🏆 <b>Verifica finale superata</b> con il <b>${fmtPct(d.passed.percent)}</b> il ${fmtDate(d.passed.at)}. Allenamento e ripasso restano sempre disponibili.</div>
       <button class="btn primary" data-act="myCert">🎓 Vedi certificato</button></div>`;
+  if(e.st==='pending') return `<div class="banner admin"><div class="grow">🕒 <b>Verifica consegnata</b> il ${fmtDT(e.pending.completedAt)}: punteggio provvisorio <b>${fmtPct(e.pending.percent)}</b>.
+      L’attestato sarà disponibile appena il docente <b>convalida</b> la verifica (ricontrolla le tue risposte e conferma il punteggio).</div></div>`;
   if(e.st==='running') return `<div class="banner admin"><div class="grow">⏸ Hai una <b>verifica finale in corso</b> (schermata ${d.exam.step+1} di ${d.exam.games.length}).</div>
       <button class="btn primary" data-act="startExam">▶ Riprendi la verifica</button></div>`;
   if(e.st==='ready') return `<div class="banner admin"><div class="grow">🎯 <b>Allenamento completato!</b> La verifica finale è disponibile${e.used?` (tentativi rimasti: <b>${e.left}</b>)`:''}.</div>
@@ -3484,6 +3547,7 @@ function renderExamIntro(){
   else if(e.st==='running') action = `<button class="btn primary" data-act="startExam">▶ Riprendi la verifica</button>`;
   else if(e.st==='ready') action = `<button class="btn primary" data-act="startExam">Inizia la verifica</button>`;
   else if(e.st==='passed'){ note = `✔ Hai già superato la verifica con il ${fmtPct(d.passed.percent)}.`; action = `<button class="btn primary" data-act="myCert">🎓 Vedi certificato</button>`; }
+  else if(e.st==='pending') note = `🕒 Verifica consegnata (punteggio provvisorio ${fmtPct(e.pending.percent)}): l’attestato arriva dopo la convalida del docente.`;
   else if(e.st==='locked') note = `🔒 Completa prima tutti i ${TOTAL} giochi dell’allenamento (${computeStats(d).solved}/${TOTAL}).`;
   else if(e.st==='cooldown') note = `⏳ Potrai riprovare dal ${fmtDT(e.nextAt)}.`;
   else if(e.st==='exhausted') note = `Hai usato tutti i tentativi disponibili: chiedi al docente un nuovo tentativo.`;
@@ -3501,6 +3565,7 @@ function renderExamIntro(){
         <li>Se chiudi la pagina, la verifica riprende dalla schermata a cui eri arrivato.</li>
         <li>Gli elementi sbagliati finiscono nel ripasso.</li>
         ${state.serverGrading ? '<li>🛡️ Domande e correzione sono gestite dal server della scuola.</li>' : ''}
+        ${!admin && needsValidation() ? '<li>🛡️ Alla consegna vedi subito il punteggio; l’<b>attestato</b> viene rilasciato quando il docente ha <b>convalidato</b> la verifica.</li>' : ''}
       </ul>
       ${!admin && e.st!=='passed' ? `<div class="sub">Tentativi rimasti: <b>${e.left}</b> di ${examAllowed(d)}</div>` : ''}
       ${r.due && (e.st==='ready') ? `<div class="banner warn" style="text-align:left"><div class="grow">🔁 Hai <b>${r.due}</b> element${r.due===1?'o':'i'} da ripassare: conviene farlo prima di iniziare.</div><button class="btn" data-act="startReview">Ripassa prima</button></div>` : ''}
@@ -3535,7 +3600,9 @@ function renderExamResult(){
   let after = '';
   if(!admin){
     const d = state.student, e = examInfo(d);
-    if(pass) after = `<button class="btn primary" data-act="myCert">🎓 Vedi il certificato</button>`;
+    if(pass && R.provisional) after = `<div class="banner admin" style="text-align:left"><div class="grow">🕒 <b>Punteggio provvisorio.</b> Il docente ricontrollerà le tue risposte:
+        dopo la <b>convalida</b> troverai l’attestato nella home del corso.</div></div>`;
+    else if(pass) after = `<button class="btn primary" data-act="myCert">🎓 Vedi il certificato</button>`;
     else after = `<div class="banner ko" style="text-align:left"><div class="grow">${e.left
         ? `Tentativi rimasti: <b>${e.left}</b>. Potrai riprovare dal <b>${fmtDT(e.nextAt)}</b>: nel frattempo ripassa gli elementi sbagliati.`
         : `Hai usato tutti i tentativi disponibili: continua con il ripasso e chiedi al docente un nuovo tentativo.`}</div></div>`;
@@ -3543,12 +3610,12 @@ function renderExamResult(){
   $('#app').innerHTML = topbar() + `
     <div class="card final">
       <div class="emo">${pass ? '🏆' : '📉'}</div>
-      <h1>${pass ? 'Verifica superata!' : 'Verifica non superata'}</h1>
+      <h1>${pass ? (R.provisional ? 'Verifica consegnata!' : 'Verifica superata!') : 'Verifica non superata'}</h1>
       <div class="big ${pass?'ok':'ko'}">${fmtPct(R.percent)}</div>
       <div class="sub">${R.correct} punti su ${R.total} · soglia ${CONFIG.PASS_THRESHOLD}%${admin ? ' · 👁 anteprima, non salvata' : ''}</div>
       ${wrong && !admin ? `<div class="sub">I ${wrong} elementi sbagliati sono stati aggiunti al <b>ripasso</b>.</div>` : ''}
-      <div class="actions" style="justify-content:center;margin-bottom:12px">${pass||admin ? after : ''}<button class="btn" data-act="home">Torna ai livelli</button></div>
-      ${!pass && !admin ? after : ''}
+      <div class="actions" style="justify-content:center;margin-bottom:12px">${(pass && !R.provisional)||admin ? after : ''}<button class="btn" data-act="home">Torna ai livelli</button></div>
+      ${(!pass || R.provisional) && !admin ? after : ''}
       <details class="rv" ${pass ? '' : 'open'}><summary>📋 Rivedi le risposte (${wrong} error${wrong===1?'e':'i'})</summary>${examReviewHTML(R.exam, R.writeRes)}</details>
     </div>`;
 }
@@ -3613,12 +3680,40 @@ async function loadAdminRows(){
   try{
     const rows = await backend.list(COURSE.coll);
     state.admin.rows = rows.filter(r => !isAdminEmail(r.email)).map(migrateDoc);
+    await validatePending(state.admin.rows);
   }catch(e){
     console.error(e); toast('⚠ Impossibile leggere gli studenti: controlla le regole di Firestore.');
   }
   state.admin.loading = false;
 }
 
+/* Convalida: il browser del docente ricorregge ogni verifica consegnata e non ancora convalidata,
+   a partire dalle domande e dalle risposte salvate (il punteggio dichiarato dallo studente non conta) */
+async function validatePending(rows){
+  if(!COURSE.examEnabled) return;
+  let nOk = 0, nBad = 0;
+  for(const d of rows){
+    const todo = (d.examAttempts || []).filter(t => attemptView(d, t).pending);
+    if(!todo.length) continue;
+    const validations = {...(d.validations || {})}; let passed = d.passed || null;
+    for(const t of todo){
+      const ex = {games: t.games, answers: t.answers || {}}, bad = examStructureError(ex);
+      const sc = bad ? {correct:0, total:EXAM_ITEMS, percent:0, wrong:[]} : await scoreExam(ex);
+      const ok = !bad && sc.percent >= CONFIG.PASS_THRESHOLD;
+      const mismatch = !!bad || sc.correct !== t.correct || sc.total !== t.total;
+      validations[t.n] = {at:nowISO(), correct:sc.correct, total:sc.total, percent:sc.percent, passed:ok, wrong:sc.wrong,
+                          claimed:t.percent ?? null, mismatch, invalid:bad || null};
+      if(ok && !passed) passed = {percent:sc.percent, correct:sc.correct, total:sc.total, at:t.completedAt, attempt:t.n,
+                                  code:makeCode(d.uid + '|' + t.completedAt), validatedAt:nowISO()};
+      if(mismatch) nBad++; else nOk++;
+    }
+    const upd = {validations}; if(passed !== (d.passed || null)) upd.passed = passed;
+    try{ await backend.patch(COURSE.coll, d.uid, upd); Object.assign(d, upd); }
+    catch(e){ console.error(e); toast('⚠ Convalida non salvata: controlla le regole di Firestore.'); return; }
+  }
+  if(nOk || nBad) toast(`✔ Convalidate ${nOk + nBad} verifiche${nBad ? ` — ⚠️ ${nBad} con punteggio dichiarato diverso da quello ricalcolato` : ''}`);
+}
+const flagged = d => Object.values(d.validations || {}).some(v => v.mismatch);
 const examScore = r => r.d.passed ? r.d.passed.percent : r.e.best;
 const SORTERS = {
   name:r=>(r.d.name||'').toLowerCase(), solved:r=>r.s.solved, errors:r=>r.s.errors, review:r=>r.rv.total,
@@ -3717,7 +3812,7 @@ function renderAdmin(){
       <td>${s.solved}/${TOTAL}<div class="mini"><i style="width:${Math.round(s.solved/TOTAL*100)}%"></i></div></td>
       <td>${s.errors}</td>
       <td>${rv.total}<div class="em">${rv.due} oggi · ${d.reviewMastered||0} consolidati</div></td>
-      <td class="${pc}">${fmtPct(sc)}<div class="em">${e.used}/${examAllowed(d)} tentativi${e.st==='running'?' · in corso':''}</div></td>
+      <td class="${pc}">${fmtPct(sc)}<div class="em">${e.used}/${examAllowed(d)} tentativi${e.st==='running'?' · in corso':''}${e.st==='pending'?' · da convalidare':''}</div>${flagged(d) ? '<div class="em ko" title="Il punteggio inviato dal browser non coincide con la ricorrezione">⚠️ punteggio alterato</div>' : ''}</td>
       <td>${dlCell(r)}</td>
       <td><span class="st ${status}">${STATUS_LABEL[status]}</span></td>
       <td class="em">${fmtDT(d.lastSeen)}</td>
@@ -3777,7 +3872,7 @@ function renderAdmin(){
     return {g, k, avg: k ? err/k : 0};
   }).filter(x=>x.k && x.avg>0).sort((a,b)=>b.avg-a.avg).slice(0,6);
   const seen = {}, miss = {};
-  for(const r of rows) for(const t of r.d.examAttempts||[]){
+  for(const r of rows) for(const t of (r.d.examAttempts||[]).map(x=>attemptView(r.d, x))){
     (t.items||[]).forEach(k=>seen[k]=(seen[k]||0)+1);
     (t.wrong||[]).forEach(k=>miss[k]=(miss[k]||0)+1);
   }
@@ -3791,10 +3886,11 @@ function renderAdmin(){
     <div class="tabs">${Object.values(COURSES).map(c=>`<button class="btn sm ${c.id===COURSE.id?'primary':''}" data-act="chooseCourse" data-id="${c.id}">${c.icon} ${esc(c.short)}</button>`).join('')}</div>
     <h1>📋 Pannello docente${A.classe ? ` · ${A.classe === '—' ? 'senza classe' : 'classe ' + esc(A.classe)}` : ''}</h1>
     <div class="sub">${esc(COURSE.title)} · ${COURSE.examEnabled ? `verifica finale: ${EXAM_ITEMS} punti, ${CONFIG.EXAM.ATTEMPTS} tentativi, soglia ${CONFIG.PASS_THRESHOLD}%` : 'verifica finale in arrivo'}
-      · ${state.serverGrading ? '🛡️ correzione sul server attiva' : backend?.mode === 'firebase' ? '⚠️ correzione nel browser (server non attivo)' : 'modalità demo'}</div>
+      · ${state.serverGrading ? '🛡️ correzione sul server attiva' : needsValidation() ? '🛡️ convalida del docente: le verifiche vengono ricorrette all’apertura del pannello' : backend?.mode === 'firebase' ? '⚠️ correzione nel browser' : 'modalità demo'}</div>
     ${statCards([['Studenti',n],['Non iniziato',cnt('nuovo')],['In allenamento',cnt('in_corso')],['In verifica',cnt('verifica')],
                  ['Superati',cnt('superato'),'good'],['Non superati',cnt('non_superato'),cnt('non_superato')?'bad':''],
-                 ['In ritardo',late,late?'bad':''],['Media verifica',fmtPct(avg)]])}
+                 ['In ritardo',late,late?'bad':''],['Media verifica',fmtPct(avg)],
+                 ...(rows.some(r=>flagged(r.d)) ? [['⚠️ Punteggi alterati', rows.filter(r=>flagged(r.d)).length, 'bad']] : [])])}
     <div class="toolbar">
       <select id="classFilter" class="search sel" style="flex:0 0 auto">
         <option value="">🏫 Tutte le classi</option>${classes.map(c=>`<option value="${esc(c)}" ${A.classe===c?'selected':''}>${esc(c)}</option>`).join('')}
@@ -3831,7 +3927,7 @@ async function setStudentClass(uid, c){
   try{
     for(const course of Object.values(COURSES)){
       const doc = await backend.load(course.coll, uid);
-      if(doc){ doc.classe = c || null; await backend.save(course.coll, uid, doc); }
+      if(doc) await backend.patch(course.coll, uid, {classe: c || null});
     }
     await loadAdminRows(); render(); toast('Classe aggiornata');
   }catch(e){ console.error(e); toast('⚠ Operazione non riuscita'); }
@@ -3840,7 +3936,7 @@ const CLASS_ACTIONS = {
   pickClass(ds){
     state.classe = ds.c;
     for(const [id, d] of Object.entries(state.docs)){
-      if(d){ d.classe = ds.c; backend.save(COURSES[id].coll, state.user.uid, JSON.parse(JSON.stringify(d))).catch(e=>console.error(e)); }
+      if(d){ d.classe = ds.c; backend.patch(COURSES[id].coll, state.user.uid, {classe: ds.c}).catch(e=>console.error(e)); }
     }
     state.screen = 'courses'; render();
   },
@@ -3883,7 +3979,12 @@ function detailModal(uid){
       ${l.games.map(g=>{ const r=d.games?.[gk(g.id)]; const cls=!r?'none':r.solved?'ok':'wip';
         return `<span class="chip ${cls}" title="Verifiche ${r?.attempts||0} · Errori ${r?.errors||0}">${g.id}${r?` <small>${r.attempts}v·${r.errors}e</small>`:''}</span>`; }).join('')}
     </div></div>`).join('');
-  const tries = (d.examAttempts||[]).map(t=>`Tentativo ${t.n}: <b>${fmtPct(t.percent)}</b> (${t.correct}/${t.total}) · ${fmtDT(t.completedAt)} — ${t.passed?'✔ superato':'✘ non superato'}`).join('<br>');
+  const tries = (d.examAttempts||[]).map(t0=>{ const t = attemptView(d, t0), v = t.v;
+    const note = t.pending ? ' · 🕒 da convalidare'
+      : v?.invalid ? ` · <b class="ko">⛔ verifica non valida (${esc(v.invalid)}): dichiarava ${fmtPct(v.claimed)}</b>`
+      : v?.mismatch ? ` · <b class="ko">⚠️ dichiarava ${fmtPct(v.claimed)}, ricorretta ${fmtPct(v.percent)}</b>`
+      : v ? ' · ✔ convalidata' : '';
+    return `Tentativo ${t.n}: <b>${fmtPct(t.percent)}</b> (${t.correct}/${t.total}) · ${fmtDT(t.completedAt)} — ${t.passed?'✔ superato':'✘ non superato'}${note}`; }).join('<br>');
   const hist = (d.history||[]).map(h=> h.type==='reset'
       ? `Azzerato il ${fmtDT(h.at)} · allenamento ${h.solved}/${TOTAL} · verifiche: ${(h.exams||[]).map(x=>fmtPct(x.percent)).join(', ')||'nessuna'}${h.passed?` · certificato ${esc(h.passed.code||'')}`:''}`
       : `Versione precedente: ${fmtPct(h.percent)} · ${fmtDT(h.completedAt)}`).join('<br>');
@@ -4187,16 +4288,22 @@ async function finishExam(){
     return;
   }
   const sc = await scoreExam(ex), passed = sc.percent >= CONFIG.PASS_THRESHOLD, at = nowISO();
+  let provisional = false;
   if(state.role==='student'){
-    const d = state.student, n = d.examAttempts.length + 1;
-    d.examAttempts.push({n, startedAt:ex.startedAt, completedAt:at, correct:sc.correct, total:sc.total, percent:sc.percent, passed, wrong:sc.wrong, items:sc.all,
-                         queries:Object.fromEntries(ex.games.filter(g=>g.write).map(g=>[g.id, (ex.answers[g.id]||{}).sql || '']))});
-    if(passed) d.passed = {percent:sc.percent, correct:sc.correct, total:sc.total, at, attempt:n, code:makeCode(state.user.uid+'|'+at)};
+    const d = state.student, n = d.examAttempts.length + 1, val = needsValidation();
+    /* si salvano domande e risposte: il docente potrà ricorreggere la verifica */
+    const t = {n, startedAt:ex.startedAt, completedAt:at, completedMs:Date.now(), correct:sc.correct, total:sc.total, percent:sc.percent, passed,
+               wrong:sc.wrong, items:sc.all, games:ex.games, answers:ex.answers,
+               queries:Object.fromEntries(ex.games.filter(g=>g.write).map(g=>[g.id, (ex.answers[g.id]||{}).sql || '']))};
+    if(!val) t.auto = true;
+    d.examAttempts.push(t);
+    if(passed && !val) d.passed = {percent:sc.percent, correct:sc.correct, total:sc.total, at, attempt:n, code:makeCode(state.user.uid+'|'+at)};
+    provisional = val;
     reviewAdd(d, sc.wrong);
-    d.exam = null; d.lastSeen = at;
-    persist();
+    d.exam = null; d.lastSeen = at; d.lastExamEnd = at;
+    persist({examEnd:true});
   }
-  state.examResult = {...sc, passed, at, exam:ex};
+  state.examResult = {...sc, passed, provisional, at, exam:ex};
   state.exam = null; state.mode = 'practice';
   state.screen = 'examResult'; render();
 }
@@ -4216,7 +4323,14 @@ function loadReviewStep(){
 async function adminUpdate(uid, fn, okMsg){
   const d = state.admin.rows.find(r=>r.uid===uid); if(!d) return;
   const copy = JSON.parse(JSON.stringify(d)); delete copy.uid;
-  try{ await backend.save(COURSE.coll, uid, fn(copy)); await loadAdminRows(); render(); toast(okMsg); }
+  const before = JSON.parse(JSON.stringify(d)), after = fn(copy), upd = {};
+  /* si scrivono solo i campi cambiati: niente sovrascritture di ciò che lo studente sta salvando */
+  for(const k of new Set([...Object.keys(before), ...Object.keys(after)])){
+    if(k === 'uid') continue;
+    if(!(k in after)) upd[k] = null;
+    else if(JSON.stringify(after[k]) !== JSON.stringify(before[k])) upd[k] = after[k];
+  }
+  try{ if(Object.keys(upd).length) await backend.patch(COURSE.coll, uid, upd); await loadAdminRows(); render(); toast(okMsg); }
   catch(e){ console.error(e); toast('⚠ Operazione non riuscita'); }
 }
 const ACTIONS = {
@@ -4359,16 +4473,16 @@ const ACTIONS = {
   async grantAttempt(ds){
     const d = state.admin.rows.find(r=>r.uid===ds.uid); if(!d) return;
     if(!confirm(`Concedere a ${d.name} un tentativo in più della verifica finale, utilizzabile subito?`)) return;
-    await adminUpdate(ds.uid, c => { c.extraAttempts = (c.extraAttempts||0) + 1; c.cooldownResetAt = nowISO(); return c; }, 'Tentativo concesso');
+    await adminUpdate(ds.uid, c => { c.extraAttempts = (c.extraAttempts||0) + 1; c.cooldownResetAt = nowISO(); c.lastExamEnd = null; return c; }, 'Tentativo concesso');
   },
   async resetStudent(ds){
     const d = state.admin.rows.find(r=>r.uid===ds.uid); if(!d) return;
     if(!confirm(`Azzerare tutti i progressi di ${d.name}?\nAllenamento, ripasso, tentativi di verifica${d.passed?' e certificato':''} ripartono da zero; nello storico resta un riepilogo.`)) return;
     await adminUpdate(ds.uid, c => {
       c.history = [...(c.history||[]), {type:'reset', at:nowISO(), solved:computeStats(c).solved,
-        exams:(c.examAttempts||[]).map(t=>({n:t.n, percent:t.percent, passed:t.passed, at:t.completedAt})),
+        exams:(c.examAttempts||[]).map(t=>attemptView(c, t)).map(t=>({n:t.n, percent:t.percent, passed:t.passed, at:t.completedAt})),
         passed:c.passed ? {percent:c.passed.percent, at:c.passed.at, code:c.passed.code} : null}];
-      Object.assign(c, {games:{}, review:{}, reviewMastered:0, exam:null, examDraft:null, examAttempts:[], extraAttempts:0, passed:null, cooldownResetAt:null});
+      Object.assign(c, {games:{}, review:{}, reviewMastered:0, exam:null, examDraft:null, examAttempts:[], extraAttempts:0, passed:null, cooldownResetAt:null, validations:{}, lastExamEnd:null});
       ['status','percent','certCode','completedAt','courseAttempt'].forEach(k => delete c[k]);
       return c;
     }, 'Progressi azzerati');
